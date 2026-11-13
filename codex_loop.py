@@ -755,7 +755,14 @@ def main() -> int:
     if a.web:
         sys.path.insert(0, str(Path(__file__).resolve().parent))  # found even under `python3 -I`
         import codex_loop_web
-        return codex_loop_web.serve(REGISTRY.parent / "tasks", a.web_host, a.web_port)
+        # Tasks started from the page run the same command this one was started with (the launcher, when there
+        # is one, so its defaults and its model-server start apply), else this script with the same model options.
+        launch = [os.environ["CODEX_LOOP_CMD"]] if os.environ.get("CODEX_LOOP_CMD") else [
+            sys.executable, str(Path(__file__).resolve()), "--codex-bin", a.codex_bin, "--model", a.model,
+            "--base-url", a.base_url, "--wire-api", a.wire_api, "--api-key-env", a.api_key_env,
+            "--context-window", str(a.context_window), "--tool-output-tokens", str(a.tool_output_tokens),
+            "--sandbox", a.sandbox, "--iter-timeout", str(a.iter_timeout), "--stuck-after", str(a.stuck_after)]
+        return codex_loop_web.serve(REGISTRY.parent / "tasks", a.web_host, a.web_port, launch)
     if a.goal_file:
         a.goal = Path(a.goal_file).read_text()
     if not a.compact_at:

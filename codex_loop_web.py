@@ -3,16 +3,22 @@
 
 It serves what the loop already writes: the task records in ~/.codex-loop/tasks/ and,
 while it still exists, each task's state directory under /tmp. It also browses the task's
-working directory and takes uploads into it; nothing else is ever written.
+working directory, takes uploads into it, and can start and stop tasks. Everything that
+changes something (start, stop, upload) needs the access token in ~/.codex-loop/web-token.
 Standard library only. Start it with `codex_loop.py --web`.
 """
 from __future__ import annotations
 
+import hmac
 import http.server
 import json
 import mimetypes
 import os
 import re
+import secrets
+import signal
+import socket
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -186,8 +192,87 @@ def preview(f: Path) -> dict | None:
     return {"size": size, "text": head.decode("utf-8", errors="replace"), "cut": size > MAX_PREVIEW}
 
 
+def read_token(home: Path) -> str:
+    """The access token, made on first use. Whoever has it can run commands as this user."""
+    path = home / "web-token"
+    try:
+        token = path.read_text().strip()
+    except OSError:
+        token = ""
+    if len(token) < 16:
+        token = secrets.token_urlsafe(18)
+        home.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+    return token
+
+
+def start_task(root: Path, launch: list[str], body: dict) -> tuple[int, dict]:
+    goal = str(body.get("goal", "")).strip()
+    raw = str(body.get("workspace", "")).strip()
+    if not goal:
+        return 400, {"error": "The goal is empty."}
+    if not raw or "\0" in raw:
+        return 400, {"error": "The working directory is missing."}
+    ws = Path(raw).expanduser()
+    if not ws.is_absolute():
+        ws = Path.home() / ws
+    try:
+        ws.mkdir(parents=True, exist_ok=True)
+        ws = ws.resolve(strict=True)
+    except OSError as e:
+        return 400, {"error": f"The working directory cannot be used: {e.strerror or e}"}
+    for t in tasks(root):
+        if t.get("status") == "running" and t.get("workspace") == str(ws):
+            return 409, {"error": "A task is already running in that directory. Stop it first, or use another directory."}
+    cmd = launch + ["-C", str(ws)]
+    if body.get("restart"):
+        cmd.append("--restart")
+    iters = body.get("max_iters")
+    if isinstance(iters, int) and iters > 0:
+        cmd += ["--max-iters", str(iters)]
+    cmd += ["--", goal]  # after "--" a goal that begins with a dash is still the goal
+    logs = root.parent / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.log"
+    try:
+        with open(log, "w") as out:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, cwd=ws,
+                                    start_new_session=True)
+    except OSError as e:
+        return 500, {"error": f"The loop could not be started: {e}"}
+    try:
+        rc = proc.wait(timeout=2)  # a refusal (another goal already in that folder, no codex) shows at once
+    except subprocess.TimeoutExpired:
+        return 200, {"ok": True, "pid": proc.pid, "workspace": str(ws), "log": str(log)}
+    return 409, {"error": (read(log, 2000).strip() or f"The loop ended at once (exit {rc}).")}
+
+
+def stop_task(root: Path, name: str) -> tuple[int, dict]:
+    t = load_task(root / f"{name}.json") if NAME.match(name) else None
+    if t is None:
+        return 404, {"error": "No such task."}
+    if t.get("status") != "running":
+        return 409, {"error": "This task is not running."}
+    pid = int(t["pid"])
+    try:  # the pid must still be a loop, not some later process that got the same number
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if not any(a.endswith(b"codex_loop.py") for a in cmdline):
+            return 409, {"error": "The recorded process is not a loop any more."}
+    except OSError:
+        pass  # no /proc: trust the record
+    try:
+        os.kill(pid, signal.SIGTERM)  # the loop ends its Codex conversation and records "interrupted"
+    except OSError as e:
+        return 500, {"error": str(e)}
+    return 200, {"ok": True}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     root: Path
+    token: str = ""
+    launch: list[str] = []
 
     def log_message(self, *_: object) -> None:
         pass
@@ -281,13 +366,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_POST(self) -> None:
-        """Upload one file (the request body) into a directory of the task's working directory."""
+        """Start a task, stop one, or upload a file (the request body) into a task's working directory."""
         url = urllib.parse.urlsplit(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         fail = lambda code, msg: self.send(json.dumps({"error": msg}).encode(), "application/json", code)  # noqa: E731
-        # A page on another site cannot set this header, so it cannot upload through someone's browser.
-        if url.path != "/api/upload" or self.headers.get("X-Codex-Loop") != "1":
+        # A page on another site cannot set this header, so it cannot act through someone's browser.
+        if url.path not in ("/api/upload", "/api/start", "/api/stop", "/api/token") \
+                or self.headers.get("X-Codex-Loop") != "1":
             return fail(404, "not found")
+        if not hmac.compare_digest(self.headers.get("X-Token", "").encode(), self.token.encode()):
+            return fail(403, "The access token is missing or wrong.")
+        if url.path == "/api/token":
+            return self.send(b'{"ok": true}', "application/json")
+        if url.path in ("/api/start", "/api/stop"):
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(size)) if 0 < size <= 1_000_000 else {}
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                return fail(400, "bad request")
+            code, out = start_task(self.root, self.launch, body) if url.path == "/api/start" \
+                else stop_task(self.root, str(body.get("name", "")))
+            return self.send(json.dumps(out, ensure_ascii=False).encode(), "application/json", code)
         fname = q.get("filename", "")
         where = inside(self.root, q.get("name", ""), q.get("path", ""))
         if where is None or not where[1].is_dir():
@@ -324,19 +425,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send(json.dumps({"ok": True, "name": fname, "size": size, "replaced": replaced}).encode(), "application/json")
 
 
-def serve(root: Path, host: str, port: int) -> int:
-    Handler.root = root
+def serve(root: Path, host: str, port: int, launch: list[str]) -> int:
+    """`launch` is the command that starts a loop; `-C DIR`, options and the goal are appended to it."""
+    Handler.root, Handler.launch, Handler.token = root, launch, read_token(root.parent)
     try:
         srv = http.server.ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
         print(f"codex-loop web UI: cannot listen on {host}:{port} ({e.strerror}). Choose another with --web-port.")
         return 1
     srv.daemon_threads = True
-    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    shown = socket.gethostname() if host in ("0.0.0.0", "::") else host
     print(f"codex-loop web UI: http://{shown}:{port}/   (Ctrl+C to stop)", flush=True)
+    print(f"To start or stop tasks and to upload, open it once with the access token:\n"
+          f"  http://{shown}:{port}/?token={Handler.token}\n"
+          f"The token is kept in {root.parent / 'web-token'}. Whoever has it can run commands as you.", flush=True)
     if host not in ("127.0.0.1", "localhost", "::1"):
-        print("It has no login: anyone who can reach this address can read the goals, logs, command output and "
-              "the working directories' files, and upload files into them.", flush=True)
+        print("Reading needs no token: anyone who can reach this address can read the goals, logs, command output "
+              "and the working directories' files.", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -357,7 +462,18 @@ body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", "Hiragino S
        background:var(--bg); color:var(--text); }
 .app { display:grid; grid-template-columns:320px 1fr; height:100vh; }
 aside { border-right:1px solid var(--line); overflow:auto; background:var(--panel); }
-aside h1 { font-size:15px; margin:0; padding:14px 16px; border-bottom:1px solid var(--line); }
+aside h1 { font-size:15px; margin:0; padding:14px 16px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; justify-content:space-between; }
+form.new { max-width:760px; display:grid; gap:14px; }
+form.new label { display:grid; gap:4px; font-weight:600; }
+form.new .hint { font-weight:400; color:var(--dim); font-size:13px; }
+form.new textarea, form.new input[type=text], form.new input[type=number], form.new input[type=password] {
+  font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; width:100%; }
+form.new textarea { min-height:9em; resize:vertical; }
+form.new .check { display:flex; gap:8px; align-items:center; font-weight:400; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+button.danger { color:var(--bad); }
+.warn { border:1px solid var(--line); border-left:3px solid var(--run); border-radius:6px; padding:8px 12px; font-size:13px; }
 .task { padding:10px 16px; border-bottom:1px solid var(--line); cursor:pointer; }
 .task:hover, .task.sel { background:var(--bg); }
 .task .g { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
@@ -418,7 +534,7 @@ button:disabled { opacity:.45; cursor:default; }
 @media (max-width: 760px) { .app { grid-template-columns:1fr; height:auto; } aside { max-height:40vh; } }
 </style></head><body>
 <div class="app">
-  <aside><h1>codex-loop tasks</h1><div id="list"></div></aside>
+  <aside><h1><span>codex-loop tasks</span><button id="new">New task</button></h1><div id="list"></div></aside>
   <main id="main"><div id="detail"><div class="empty">No task selected.</div></div><div id="files"></div></main>
 <div id="box"><button class="close">Close</button><button class="prev" aria-label="Previous">‹</button><button class="next" aria-label="Next">›</button><div class="m"></div><div class="t"></div></div>
 </div>
@@ -433,7 +549,20 @@ const ago = s => { s = Math.max(0, Math.round(s)); if (s < 90) return s + " s"; 
 const num = n => (n || 0).toLocaleString("en-US");
 const when = t => new Date(t * 1000).toLocaleString();
 const QS = new URLSearchParams(location.search);
-let selected = QS.get("task") || location.hash.slice(1), openRun = "", runCache = {};
+let selected = QS.get("task") || location.hash.slice(1), openRun = "", runCache = {}, mode = "task", known = [];
+// The access token arrives once in the link that `codex-loop --web` prints, and stays in this browser.
+if (QS.get("token")) { localStorage.setItem("codex-loop-token", QS.get("token")); QS.delete("token");
+  history.replaceState(null, "", location.pathname + (QS.toString() ? "?" + QS : "") + location.hash); }
+const token = () => localStorage.getItem("codex-loop-token") || "";
+async function post(url, body, raw) {
+  try {
+    const r = await fetch(url, { method: "POST", body: raw ? body : JSON.stringify(body || {}),
+      headers: { "X-Codex-Loop": "1", "X-Token": token() } });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 403) return { error: "This needs the access token. Open the link that `codex-loop --web` printed (it is also in ~/.codex-loop/web-token on the machine), or paste the token under “New task”.", denied: true };
+    return r.ok ? j : { error: j.error || "Request failed (" + r.status + ")." };
+  } catch (e) { return { error: "The server cannot be reached: " + e.message }; }
+}
 
 async function get(url) { const r = await fetch(url); return r.ok ? r.json() : null; }
 
@@ -441,14 +570,15 @@ function statusBadge(t) { return $("span", "badge " + t.status, t.status === "do
 
 async function refreshList() { renderList(await get("/api/tasks") || []); }
 function renderList(tasks) {
+  known = tasks;
   const list = document.getElementById("list"); list.replaceChildren();
   if (!tasks.length) list.append($("div", "task meta", "No tasks yet. Start one with: codex-loop \"goal\""));
-  if (!selected && tasks.length) { selected = tasks[0].name; refreshDetail(); }
+  if (!selected && tasks.length && mode === "task") { selected = tasks[0].name; refreshDetail(); refreshFiles(); }
   for (const t of tasks) {
-    const d = $("div", "task" + (t.name === selected ? " sel" : ""));
+    const d = $("div", "task" + (t.name === selected && mode === "task" ? " sel" : ""));
     d.append(statusBadge(t), $("span", "meta", "updated " + ago(Date.now()/1000 - t.updated) + " ago"));
     d.append($("div", "g", t.goal || "(no goal)"), $("div", "meta", t.workspace));
-    d.onclick = () => { selected = t.name; location.hash = t.name; openRun = ""; dir = ""; shown = "";
+    d.onclick = () => { mode = "task"; selected = t.name; location.hash = t.name; openRun = ""; dir = ""; shown = "";
       refreshList(); refreshDetail(); refreshFiles(); };
     list.append(d);
   }
@@ -473,15 +603,19 @@ async function showRun(name, tag, box) {
   if (!r.steps.length) box.append($("div", "meta", "Nothing recorded yet."));
 }
 
-async function refreshDetail() { if (selected) renderDetail(await get("/api/task?name=" + selected)); }
+async function refreshDetail() { if (selected && mode === "task") { const t = await get("/api/task?name=" + selected); if (mode === "task") renderDetail(t); } }
 function renderDetail(t) {
   const main = document.getElementById("detail");
   if (!t) { main.replaceChildren($("div", "empty", "This task's record is gone.")); return; }
   const liveBox = main.querySelector(".live");
   const keepScroll = main.scrollTop, stick = !liveBox || liveBox.scrollTop + liveBox.clientHeight >= liveBox.scrollHeight - 8;
   const out = [];
-  const head = $("div"); head.append(statusBadge(t));
+  const head = $("div", "bar"); head.append(statusBadge(t));
   if (t.ended) head.append($("span", "meta", t.ended));
+  if (t.status === "running") { const st = $("button", "danger", "Stop this task"); st.style.marginLeft = "auto";
+    st.onclick = async () => { if (!confirm("Stop this task? It can be resumed later from its directory.")) return;
+      st.disabled = true; const r = await post("/api/stop", { name: t.name }); if (r.error) alert(r.error); refreshList(); refreshDetail(); };
+    head.append(st); }
   out.push(head, $("div", "goal", t.goal || ""));
   const f = $("div", "facts");
   const fact = (k, v) => { const s = $("span"); s.append(k + " ", $("b", "", v)); f.append(s); };
@@ -548,7 +682,7 @@ const fq = (path) => `name=${encodeURIComponent(selected)}&path=${encodeURICompo
 
 async function refreshFiles(first) {
   const box = document.getElementById("files");
-  if (!selected) { box.replaceChildren(); return; }
+  if (!selected || mode !== "task") { box.replaceChildren(); return; }
   const task = selected, l = first || await get("/api/files?" + fq(dir));
   if (task !== selected) return;
   const out = [section("Working directory")];
@@ -648,9 +782,8 @@ async function upload(files) {
   for (const f of files) {
     note = `Uploading ${f.name} (${done + 1} of ${files.length}) …`; refreshFiles();
     try {
-      const r = await fetch(`/api/upload?${fq(target)}&filename=${encodeURIComponent(f.name)}`,
-        { method: "POST", body: f, headers: { "X-Codex-Loop": "1" } });
-      if (r.ok) done++; else failed.push(f.name + ": " + ((await r.json()).error || r.status));
+      const r = await post(`/api/upload?${fq(target)}&filename=${encodeURIComponent(f.name)}`, f, true);
+      if (!r.error) done++; else { failed.push(f.name + ": " + r.error); if (r.denied) break; }
     } catch (e) { failed.push(f.name + ": " + e.message); }
   }
   if (task !== selected) return;
@@ -662,12 +795,51 @@ fb.addEventListener("dragover", e => { e.preventDefault(); fb.classList.add("dra
 fb.addEventListener("dragleave", () => fb.classList.remove("drag"));
 fb.addEventListener("drop", e => { e.preventDefault(); fb.classList.remove("drag"); if (e.dataTransfer.files.length) upload(e.dataTransfer.files); });
 
+// ---- a new task ----
+function newTask() {
+  mode = "new"; renderList(known); document.getElementById("files").replaceChildren();
+  const f = $("form", "new"), goal = $("textarea"), ws = $("input"), dl = $("datalist"), re = $("input"), it = $("input"), tk = $("input");
+  const msg = $("div", "fail"), go = $("button", "primary", "Start the task"), cancel = $("button", "", "Cancel");
+  const field = (title, hint, el) => { const l = $("label"); l.append(title, $("span", "hint", hint), el); return l; };
+  goal.required = true; goal.placeholder = "What should be true when the work is finished?";
+  ws.type = "text"; ws.required = true; ws.setAttribute("list", "dirs"); dl.id = "dirs";
+  ws.placeholder = "~/work/my-project"; ws.value = localStorage.getItem("codex-loop-dir") || "";
+  for (const w of [...new Set(known.map(t => t.workspace))]) { const o = $("option"); o.value = w; dl.append(o); }
+  re.type = "checkbox"; it.type = "number"; it.min = "1"; it.placeholder = "no limit";
+  tk.type = "password"; tk.autocomplete = "off"; tk.placeholder = token() ? "saved in this browser" : "paste the token";
+  const chk = $("label", "check"); chk.append(re, "Replace the earlier task of this directory (its loop state is discarded; the files stay)");
+  const row = $("div", "bar"); go.type = "submit"; cancel.type = "button"; row.append(go, cancel);
+  f.append($("h2", "", "New task"),
+    field("Goal", "The loop plans completion criteria from this, then works until an independent evaluation passes all of them.", goal),
+    field("Working directory", "On the machine that runs the loop. It is created if it does not exist; a path without a leading / is taken from the home folder.", ws), dl,
+    chk,
+    field("Stop after this many iterations", "Leave empty to run until the goal is met.", it),
+    field("Access token", "Needed once per browser. It is printed by `codex-loop --web` and kept in ~/.codex-loop/web-token.", tk),
+    $("div", "warn", "The agent runs without approvals and, by default, without a sandbox: its commands have the full rights of the user who started this web UI."),
+    msg, row);
+  cancel.onclick = () => { mode = "task"; renderList(known); refreshDetail(); refreshFiles(); };
+  f.onsubmit = async e => { e.preventDefault(); msg.textContent = ""; go.disabled = true; go.textContent = "Starting …";
+    if (tk.value.trim()) localStorage.setItem("codex-loop-token", tk.value.trim());
+    localStorage.setItem("codex-loop-dir", ws.value.trim());
+    const r = await post("/api/start", { goal: goal.value, workspace: ws.value.trim(), restart: re.checked, max_iters: parseInt(it.value) || 0 });
+    if (r.error) { msg.textContent = r.error; go.disabled = false; go.textContent = "Start the task"; return; }
+    // The loop writes its record within a moment; open it as soon as it is there.
+    for (let i = 0; i < 20; i++) { await new Promise(x => setTimeout(x, 500));
+      const t = (await get("/api/tasks") || []).find(x => x.pid === r.pid && x.status === "running");
+      if (t) { mode = "task"; selected = t.name; location.hash = t.name; openRun = ""; dir = ""; shown = ""; view = "list";
+        refreshList(); refreshDetail(); refreshFiles(); return; } }
+    msg.textContent = "The loop was started (process " + r.pid + ") but its record has not appeared. Its output is in " + r.log + " on the machine.";
+    go.disabled = false; go.textContent = "Start the task"; };
+  document.getElementById("detail").replaceChildren(f); goal.focus();
+}
+document.getElementById("new").onclick = newTask;
+
 const BOOT = /*BOOT*/null;
 if (BOOT && BOOT.name && (!selected || selected === BOOT.name)) {
   selected = BOOT.name; renderList(BOOT.tasks); renderDetail(BOOT.task);
   refreshFiles(BOOT.files);
 } else { refreshList(); refreshDetail(); refreshFiles(); }
-setInterval(() => { if (!document.hidden && !shown && view === "list" && !note.startsWith("Uploading") && !window.getSelection().toString()) refreshFiles(); }, 6000);
+setInterval(() => { if (!document.hidden && mode === "task" && !shown && view === "list" && !note.startsWith("Uploading") && !window.getSelection().toString()) refreshFiles(); }, 6000);
 setInterval(refreshList, 5000);
 setInterval(() => { if (!document.hidden && !window.getSelection().toString()) refreshDetail(); }, 2000);
 </script></body></html>

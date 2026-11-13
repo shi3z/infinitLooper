@@ -71,6 +71,17 @@ when the output is not a terminal.
 codex-loop --web          # http://127.0.0.1:8790/
 ```
 
+**New task** (top left) starts a loop from the page: a goal, a working directory on the
+machine (created if missing), optionally a limit on iterations. A running task has a
+**Stop this task** button; a stopped task resumes with `codex-loop` in its directory,
+or by starting it again from the page with the same goal. Tasks started from the page
+write their terminal output to `~/.codex-loop/logs/`.
+
+Starting, stopping and uploading need an access token, because whoever can start a
+task can run commands as you. `codex-loop --web` prints a link that carries the token;
+open it once and the browser remembers it. The token is kept in
+`~/.codex-loop/web-token`; delete that file to get a new one. Reading needs no token.
+
 A page with every task on the left and, for the selected one: the goal and status,
 the latest progress (the same stream as the terminal view, refreshed every two
 seconds), the latest evaluation per criterion, and the record of every conversation
@@ -79,7 +90,7 @@ and what it said.
 
 Below that is the task's working directory: browse folders, preview text and images,
 download any file, and upload files into the folder shown (button or drag and drop;
-a file of the same name is replaced, up to 2 GB each). The page cannot reach anything
+a file of the same name is replaced, up to 2 GB each; needs the token). The page cannot reach anything
 outside the working directory, and it cannot delete or rename.
 
 **Gallery** switches the folder to a grid of its pictures and videos, 48 to a page, with
@@ -91,9 +102,8 @@ directly.
 Task records are kept in `~/.codex-loop/tasks/`, so the list survives a reboot; the
 details of a task (progress, conversations, state) are read from its `/tmp` directory
 and disappear with it. `--web-host 0.0.0.0` makes the page reachable from other
-machines. It has no login: anyone who can reach it can read goals, logs, command output
-and the working directories' files, and can upload files into them, where a running
-agent may pick them up. `--web-port` changes the port.
+machines. Reading has no login: anyone who can reach it can read goals, logs, command
+output and the working directories' files. `--web-port` changes the port.
 
 ## No long context
 

@@ -10,7 +10,8 @@
 here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 : "${CODEX_BIN:=codex}"
 : "${LOOP_URL:=http://127.0.0.1:8080/v1}"
-export CODEX_BIN
+CODEX_LOOP_CMD=$(readlink -f "$0")  # the web UI starts tasks with this same command
+export CODEX_BIN CODEX_LOOP_CMD
 if [ -n "${LOOP_SERVER:-}" ] && ! curl -s -m 3 "$LOOP_URL/models" >/dev/null 2>&1; then
   mkdir -p "$HOME/.codex-loop"
   echo "[codex-loop] starting the model server: $LOOP_SERVER (log: ~/.codex-loop/server.log)"
