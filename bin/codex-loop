@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# codex-loop "goal"   run Codex in the current directory until the goal is met
+# codex-loop          resume the loop in the current directory
+#
+# Environment:
+#   CODEX_BIN    the codex executable (default: codex on PATH)
+#   LOOP_URL     OpenAI-compatible server (default: http://127.0.0.1:8080/v1)
+#   LOOP_SERVER  optional command that starts that server; run when nothing answers on LOOP_URL
+here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+: "${CODEX_BIN:=codex}"
+: "${LOOP_URL:=http://127.0.0.1:8080/v1}"
+export CODEX_BIN
+if [ -n "${LOOP_SERVER:-}" ] && ! curl -s -m 3 "$LOOP_URL/models" >/dev/null 2>&1; then
+  mkdir -p "$HOME/.codex-loop"
+  echo "[codex-loop] starting the model server: $LOOP_SERVER (log: ~/.codex-loop/server.log)"
+  setsid nohup sh -c "$LOOP_SERVER" > "$HOME/.codex-loop/server.log" 2>&1 < /dev/null &
+  i=0
+  until curl -s -m 3 "$LOOP_URL/models" 2>/dev/null | grep -q '"id"'; do
+    i=$((i + 1))
+    [ "$i" -gt 180 ] && { echo "[codex-loop] the server did not come up in 15 minutes; see the log"; exit 1; }
+    sleep 5
+  done
+fi
+exec python3 "$here/codex_loop.py" --base-url "$LOOP_URL" "$@"
