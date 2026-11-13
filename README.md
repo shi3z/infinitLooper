@@ -19,7 +19,7 @@ codex-loop "Add a /health endpoint with tests; the whole test suite must pass."
 
 | Step | Conversation | What it does |
 | --- | --- | --- |
-| once | planner | writes `.codex-loop/CRITERIA.md`: 3 to 8 checkable completion criteria, each with the command that proves it |
+| once | planner | writes `CRITERIA.md`: 3 to 8 checkable completion criteria, each with the command that proves it |
 | each iteration | worker | reads the goal, criteria, state and last verdict; does one chunk of work; rewrites `STATE.md` |
 | each iteration | evaluator | runs every check itself, without trusting the worker, and returns a JSON verdict |
 
@@ -32,6 +32,20 @@ codex-loop "Add a /health endpoint with tests; the whole test suite must pass."
 - The loop ends on success, `--max-iters`, `--max-hours` or Ctrl+C. Exit code 0
   means the goal was met, 2 that a limit was reached. State is on disk, so running
   `codex-loop` with no goal resumes.
+
+## Where the context lives
+
+The agent's whole context is a set of files in a randomly named directory under
+`/tmp`, created at the start and printed as `context: /tmp/codex-loop-xxxxxxxx`:
+`GOAL.md`, `CRITERIA.md`, `STATE.md`, `EVAL.md`, `log.jsonl` (one row per conversation
+with token usage, and every verdict) and `runs/` (the Codex event stream, stderr and
+last message of each conversation). Nothing is written into the project except the
+work itself.
+
+`~/.codex-loop/sessions.json` remembers which directory belongs to which workspace,
+so resuming needs no argument; `--state DIR` names one explicitly and `--tmp-dir`
+changes the parent. `/tmp` is usually emptied on reboot: after that, start again
+with the goal.
 
 ## Watching it work
 
@@ -62,7 +76,7 @@ The design follows [You don't need long context](https://arxiv.org/abs/2611.0530
   a deliberately small window (default 48,000 / 36,000 tokens), using a recap prompt
   with fixed sections: objective, established facts, applied changes, verification,
   dead ends, remaining plan. `STATE.md` uses the same sections.
-- **Selective reading.** State lives in files. The agent is told to read only the
+- **Selective reading.** State lives in files under `/tmp`. The agent is told to read only the
   lines it needs, and a single tool result is capped at 2,500 tokens.
 
 Not implemented: the paper's single-action mode (one command per conversation). A
@@ -80,7 +94,7 @@ ln -s "$PWD/infinitLooper/bin/codex-loop" ~/.local/bin/codex-loop
 The default target is an OpenAI-compatible server with the Responses API at
 `http://127.0.0.1:8080/v1`, which is what a local
 [Strata](https://github.com/Niko1221/Strata) server provides. The harness writes its
-own Codex configuration to `.codex-loop/codex-home` in the workspace and leaves
+own Codex configuration to `~/.codex-loop/homes/<context name>` and leaves
 `~/.codex` alone, so several loops can run at once in different directories.
 
 | Environment variable | Meaning |
@@ -111,10 +125,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--max-iters`, `--max-hours` | 0 | limits; 0 means run until the goal is met |
 | `--stuck-after` | 3 | unchanged iterations before the change-approach notice |
 | `--no-live` | | no live view |
-
-Files in `.codex-loop/`: `GOAL.md`, `CRITERIA.md`, `STATE.md`, `EVAL.md`, `log.jsonl`
-(one row per conversation with token usage, and every verdict) and `runs/` (the
-Codex event stream, stderr and last message of each conversation).
+| `--state`, `--tmp-dir` | remembered, `/tmp` | the context directory, and where a new one is created |
 
 ## Status
 

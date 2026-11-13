@@ -12,7 +12,7 @@ arXiv 2611.05306):
     and a bounded state file, never the previous transcript;
   * inside one conversation Codex compacts at a low threshold (end-of-conversation
     compaction) with a recap prompt of fixed sections;
-  * durable state lives in files under .codex-loop/, and the agent is told to read
+  * durable state lives in files in a randomly named directory under /tmp, and the agent is told to read
     files selectively; tool output is capped.
 
 Standard library only.
@@ -29,13 +29,15 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
 import urllib.parse
 from pathlib import Path
 
-STATE_DIR = ".codex-loop"
+LEGACY_STATE_DIR = ".codex-loop"  # where the state lived before it moved to /tmp
+REGISTRY = Path.home() / ".codex-loop" / "sessions.json"  # workspace -> its state directory, for resuming
 STATE_SECTIONS = [
     "Objective",
     "Established facts",
@@ -375,8 +377,8 @@ class Loop:
     def __init__(self, args: argparse.Namespace) -> None:
         self.a = args
         self.ws = Path(args.workspace).resolve()
-        self.sd = self.ws / STATE_DIR
-        self.runs = self.sd / "runs"
+        self.sd = Path()  # the context: a randomly named directory under /tmp, chosen in setup()
+        self.runs = Path()
         self.env = dict(os.environ)
         self.totals = {"conversations": 0, "input_tokens": 0, "output_tokens": 0}
         self.child: subprocess.Popen | None = None
@@ -460,6 +462,11 @@ class Loop:
             f"out={usage.get('output_tokens', '?')} tokens")
         return last.read_text(errors="replace") if last.exists() else ""
 
+    def rules(self) -> str:
+        return (f"The project is the working directory `{self.ws}`: all work and every check happens there, and "
+                f"relative paths in the goal mean that directory. `{self.sd}` holds only the loop's notes "
+                f"(goal, criteria, state, verdict); never put project files in it.\n\n" + COMMON_RULES)
+
     def record(self, row: dict) -> None:
         row["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         with open(self.sd / "log.jsonl", "a") as f:
@@ -476,10 +483,10 @@ class Loop:
                 log(f"{name} was modified by the agent: restored")
 
     def workspace_fingerprint(self) -> str:
-        """Changes outside .codex-loop/, to notice an evaluator that edits or a stuck worker."""
+        """Changes in the workspace, to notice an evaluator that edits or a stuck worker."""
         h = hashlib.sha256()
         for root, dirs, files in os.walk(self.ws):
-            dirs[:] = sorted(d for d in dirs if d not in (STATE_DIR, ".git", "node_modules", ".venv",
+            dirs[:] = sorted(d for d in dirs if d not in (LEGACY_STATE_DIR, ".git", "node_modules", ".venv",
                                                          "__pycache__", "target"))
             for f in sorted(files):
                 p = Path(root) / f
@@ -491,27 +498,59 @@ class Loop:
         return h.hexdigest()
 
     # ---- phases -------------------------------------------------------------
+    def registry(self, state: Path | None = None) -> Path | None:
+        """Look up (or record) this workspace's state directory."""
+        try:
+            table = json.loads(REGISTRY.read_text())
+        except (OSError, ValueError):
+            table = {}
+        if state is not None:
+            table[str(self.ws)] = str(state)
+            REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+            REGISTRY.write_text(json.dumps(table, ensure_ascii=False, indent=1))
+            return state
+        found = table.get(str(self.ws))
+        return Path(found) if found and (Path(found) / "GOAL.md").exists() else None
+
     def setup(self) -> None:
+        """Choose the state directory. The agent's whole context is the files in it."""
+        new_goal = self.a.goal.strip() if self.a.goal is not None else None
+        sd = Path(self.a.state).resolve() if self.a.state else self.registry()
+        legacy = self.ws / LEGACY_STATE_DIR
+        if sd is None and (legacy / "GOAL.md").exists() and not self.a.restart:
+            sd = Path(tempfile.mkdtemp(prefix="codex-loop-", dir=self.a.tmp_dir))
+            shutil.copytree(legacy, sd, dirs_exist_ok=True, ignore=shutil.ignore_patterns("codex-home"))
+            log(f"moved the loop state from {legacy} to {sd} (the old folder is left as it is)")
+        if sd is not None and self.a.restart:
+            shutil.rmtree(sd, ignore_errors=True)
+            shutil.rmtree(REGISTRY.parent / "homes" / sd.name, ignore_errors=True)
+            sd = None
+        if sd is not None and new_goal is not None and (sd / "GOAL.md").exists() \
+                and (sd / "GOAL.md").read_text().strip() != new_goal:
+            sys.exit(f"{sd} holds a different goal for this workspace. Use --restart to replace it, "
+                     "or omit the goal to resume.")
+        if sd is None:
+            if new_goal is None:
+                sys.exit("No goal given and nothing to resume for this workspace "
+                         "(after a reboot /tmp is empty: start again with the goal).")
+            sd = Path(tempfile.mkdtemp(prefix="codex-loop-", dir=self.a.tmp_dir))
+        self.sd, self.runs = self.registry(sd), sd / "runs"
         self.runs.mkdir(parents=True, exist_ok=True)
         (self.sd / "frozen").mkdir(exist_ok=True)
         goal = self.sd / "GOAL.md"
-        if self.a.goal is not None:
-            if goal.exists() and goal.read_text().strip() != self.a.goal.strip() and not self.a.restart:
-                sys.exit(f"{goal} holds a different goal. Use --restart to replace it, or omit the goal to resume.")
-            if self.a.restart and self.sd.exists():
-                shutil.rmtree(self.sd)
-                self.runs.mkdir(parents=True)
-                (self.sd / "frozen").mkdir()
-            goal.write_text(self.a.goal.strip() + "\n")
+        if new_goal is not None:
+            goal.write_text(new_goal + "\n")
         elif not goal.exists():
-            sys.exit("No goal given and nothing to resume in this workspace.")
+            sys.exit(f"{self.sd} has no GOAL.md: nothing to resume.")
+        log(f"context: {self.sd}")
         shutil.copyfile(goal, self.sd / "frozen" / "GOAL.md")
         for name, text in (("STATE.md", "(first iteration: nothing has been done yet)\n"),
                            ("EVAL.md", "(no evaluation yet)\n")):
             if not (self.sd / name).exists():
                 (self.sd / name).write_text(text)
         (self.sd / "verdict.schema.json").write_text(json.dumps(VERDICT_SCHEMA))
-        self.env["CODEX_HOME"] = str(write_codex_home(self.a, self.sd / "codex-home"))
+        # Codex refuses to keep its helper binaries under /tmp, so its home stays outside the state directory.
+        self.env["CODEX_HOME"] = str(write_codex_home(self.a, REGISTRY.parent / "homes" / self.sd.name))
 
     def plan(self) -> None:
         crit = self.sd / "CRITERIA.md"
@@ -520,7 +559,7 @@ class Loop:
             return
         for attempt in range(1, 4):
             log(f"planning completion criteria (attempt {attempt})")
-            self.codex("planner", 0, PLANNER_PROMPT.format(sd=STATE_DIR, rules=COMMON_RULES), self.a.sandbox)
+            self.codex("planner", 0, PLANNER_PROMPT.format(sd=self.sd, rules=self.rules()), self.a.sandbox)
             if crit.exists() and "C1" in crit.read_text(errors="replace"):
                 shutil.copyfile(crit, frozen)
                 log("criteria:\n" + crit.read_text(errors="replace").rstrip())
@@ -532,7 +571,7 @@ class Loop:
 
     def evaluate(self, n: int) -> dict:
         before = self.workspace_fingerprint()
-        prompt = EVALUATOR_PROMPT.format(sd=STATE_DIR, rules=COMMON_RULES)
+        prompt = EVALUATOR_PROMPT.format(sd=self.sd, rules=self.rules())
         text = self.codex("evaluator", n, prompt, self.a.sandbox, self.sd / "verdict.schema.json")
         verdict = extract_json(text)
         if verdict is None:
@@ -583,8 +622,8 @@ class Loop:
                 stuck = ("\nNOTICE: the last %d iterations changed nothing. The current plan is not working. "
                          "Record it under Dead ends and take a fundamentally different approach.\n" % stale)
             sections = "".join(f"## {s}\n" for s in STATE_SECTIONS)
-            answer = self.codex("worker", n, WORKER_PROMPT.format(n=n, sd=STATE_DIR, stuck=stuck,
-                                                                sections=sections, rules=COMMON_RULES),
+            answer = self.codex("worker", n, WORKER_PROMPT.format(n=n, sd=self.sd, stuck=stuck,
+                                                                sections=sections, rules=self.rules()),
                                 self.a.sandbox)
             self.protect()
             if sha(self.sd / "STATE.md") == st:
@@ -626,9 +665,11 @@ def main() -> int:
     p.add_argument("--goal-file", help="read the goal from this file")
     p.add_argument("-C", "--workspace", default=".", help="directory the agent works in (default: .)")
     p.add_argument("--restart", action="store_true", help="discard this workspace's loop state and start over")
+    p.add_argument("--state", help="use this state directory instead of the one remembered for the workspace")
+    p.add_argument("--tmp-dir", default="/tmp", help="where the randomly named state directory is created")
     p.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     p.add_argument("--codex-home",
-                   help="private CODEX_HOME written by the harness (default: .codex-loop/codex-home in the workspace)")
+                   help="private CODEX_HOME written by the harness (default: ~/.codex-loop/homes/<state directory name>)")
     p.add_argument("--model", default="strata")
     p.add_argument("--base-url", default="http://127.0.0.1:8080/v1",
                    help="OpenAI-compatible server; pass '' to use Codex's built-in OpenAI provider")
