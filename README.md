@@ -68,7 +68,7 @@ when the output is not a terminal.
 ## Web UI
 
 ```sh
-codex-loop --web          # http://127.0.0.1:8765/
+codex-loop --web          # http://127.0.0.1:8790/
 ```
 
 A read-only page with every task on the left and, for the selected one: the goal and
@@ -144,7 +144,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--stuck-after` | 3 | unchanged iterations before the change-approach notice |
 | `--live-rows` | 10 | lines of the live view |
 | `--no-live` | | no live view |
-| `--web`, `--web-host`, `--web-port` | off, `127.0.0.1`, 8765 | serve the web UI instead of running a loop |
+| `--web`, `--web-host`, `--web-port` | off, `127.0.0.1`, 8790 | serve the web UI instead of running a loop |
 | `--state`, `--tmp-dir` | remembered, `/tmp` | the context directory, and where a new one is created |
 
 ## Status

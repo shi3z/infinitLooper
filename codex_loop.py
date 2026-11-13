@@ -748,7 +748,7 @@ def main() -> int:
     p.add_argument("--live-rows", type=int, default=10, help="lines of the live view (default: %(default)s)")
     p.add_argument("--web", action="store_true", help="serve the web UI (task records and live progress) and do nothing else")
     p.add_argument("--web-host", default="127.0.0.1", help="address the web UI listens on (default: %(default)s)")
-    p.add_argument("--web-port", type=int, default=8765, help="port of the web UI (default: %(default)s)")
+    p.add_argument("--web-port", type=int, default=8790, help="port of the web UI (default: %(default)s)")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
     a = p.parse_args()

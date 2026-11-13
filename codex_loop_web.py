@@ -136,7 +136,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def serve(root: Path, host: str, port: int) -> int:
     Handler.root = root
-    srv = http.server.ThreadingHTTPServer((host, port), Handler)
+    try:
+        srv = http.server.ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        print(f"codex-loop web UI: cannot listen on {host}:{port} ({e.strerror}). Choose another with --web-port.")
+        return 1
     srv.daemon_threads = True
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print(f"codex-loop web UI: http://{shown}:{port}/   (Ctrl+C to stop)", flush=True)
