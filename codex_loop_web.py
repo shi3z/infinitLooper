@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Web UI for codex-loop: every task's record, and what the running one is doing right now.
 
-Read-only. It serves what the loop already writes: the task records in
-~/.codex-loop/tasks/ and, while it still exists, each task's state directory under /tmp.
+It serves what the loop already writes: the task records in ~/.codex-loop/tasks/ and,
+while it still exists, each task's state directory under /tmp. It also browses the task's
+working directory and takes uploads into it; nothing else is ever written.
 Standard library only. Start it with `codex_loop.py --web`.
 """
 from __future__ import annotations
 
 import http.server
 import json
+import mimetypes
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
 
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 MAX_TEXT = 40_000
+MAX_PREVIEW = 300_000
+MAX_UPLOAD = 2 * 1024 ** 3
+INLINE = ("image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf")
 
 
 def read(path: Path, limit: int = MAX_TEXT) -> str:
@@ -98,6 +104,50 @@ def run(root: Path, name: str, tag: str) -> dict | None:
     return {"tag": tag, "steps": steps, "last": read(runs / f"{tag}.last.txt")}
 
 
+def inside(root: Path, name: str, rel: str) -> tuple[Path, Path] | None:
+    """(workspace, target) for a path inside the task's working directory; None when it leads outside it."""
+    t = load_task(root / f"{name}.json") if NAME.match(name) else None
+    if t is None:
+        return None
+    try:
+        ws = Path(str(t.get("workspace", ""))).resolve(strict=True)
+        target = (ws / rel.lstrip("/")).resolve()
+    except (OSError, ValueError):
+        return None
+    return (ws, target) if target == ws or ws in target.parents else None
+
+
+def listing(ws: Path, d: Path) -> dict | None:
+    if not d.is_dir():
+        return None
+    entries = []
+    try:
+        for e in os.scandir(d):
+            try:
+                st = e.stat()
+                entries.append({"name": e.name, "dir": e.is_dir(), "size": st.st_size, "mtime": st.st_mtime})
+            except OSError:
+                entries.append({"name": e.name, "dir": False, "size": 0, "mtime": 0})
+    except OSError:
+        return None
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return {"path": str(d.relative_to(ws)) if d != ws else "", "entries": entries[:5000], "count": len(entries)}
+
+
+def preview(f: Path) -> dict | None:
+    if not f.is_file():
+        return None
+    size = f.stat().st_size
+    kind = mimetypes.guess_type(f.name)[0] or ""
+    if kind.startswith("image/"):
+        return {"size": size, "image": True}
+    with open(f, "rb") as h:
+        head = h.read(MAX_PREVIEW)
+    if b"\0" in head[:8000]:
+        return {"size": size, "binary": True}
+    return {"size": size, "text": head.decode("utf-8", errors="replace"), "cut": size > MAX_PREVIEW}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     root: Path
 
@@ -120,7 +170,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/":
             # The newest task is drawn with the page itself, so there is no empty first paint.
             ts = tasks(self.root)
-            boot = {"tasks": ts, "task": detail(self.root, ts[0]["name"]) if ts else None}
+            boot = {"tasks": ts, "task": detail(self.root, ts[0]["name"]) if ts else None, "files": None}
+            where = inside(self.root, ts[0]["name"], "") if ts else None
+            if where:
+                boot["files"] = listing(*where)
             blob = json.dumps(boot, ensure_ascii=False).replace("</", "<\\/")
             return self.send(PAGE.replace("/*BOOT*/null", blob).encode(), "text/html; charset=utf-8")
         if url.path == "/api/tasks":
@@ -129,9 +182,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = detail(self.root, name)
         elif url.path == "/api/run" and NAME.match(name):
             data = run(self.root, name, q.get("tag", ""))
+        elif url.path in ("/api/files", "/api/file", "/raw"):
+            where = inside(self.root, name, q.get("path", ""))
+            if where and url.path == "/raw":
+                return self.raw(where[1])
+            if where:
+                data = listing(*where) if url.path == "/api/files" else preview(where[1])
         if data is None:
             return self.send(b'{"error": "not found"}', "application/json", 404)
         self.send(json.dumps(data, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+
+
+    def raw(self, f: Path) -> None:
+        if not f.is_file():
+            return self.send(b"not found", "text/plain", 404)
+        kind = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        # Files come from the agent and from uploads: never let one run as a page of this site.
+        self.send_header("Content-Type", kind if kind in INLINE else "application/octet-stream")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "sandbox")
+        disp = "inline" if kind in INLINE else "attachment"
+        self.send_header("Content-Disposition", f"{disp}; filename*=UTF-8\'\'{urllib.parse.quote(f.name)}")
+        self.send_header("Content-Length", str(f.stat().st_size))
+        self.end_headers()
+        try:
+            with open(f, "rb") as h:
+                while chunk := h.read(1 << 20):
+                    self.wfile.write(chunk)
+        except OSError:
+            pass
+
+    def do_POST(self) -> None:
+        """Upload one file (the request body) into a directory of the task's working directory."""
+        url = urllib.parse.urlsplit(self.path)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        fail = lambda code, msg: self.send(json.dumps({"error": msg}).encode(), "application/json", code)  # noqa: E731
+        # A page on another site cannot set this header, so it cannot upload through someone's browser.
+        if url.path != "/api/upload" or self.headers.get("X-Codex-Loop") != "1":
+            return fail(404, "not found")
+        fname = q.get("filename", "")
+        where = inside(self.root, q.get("name", ""), q.get("path", ""))
+        if where is None or not where[1].is_dir():
+            return fail(404, "no such directory in the working directory")
+        if not fname or fname in (".", "..") or "/" in fname or "\\" in fname or "\0" in fname:
+            return fail(400, "bad file name")
+        try:
+            size = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return fail(411, "Content-Length is required")
+        if size > MAX_UPLOAD:
+            return fail(413, f"larger than {MAX_UPLOAD // 1024 ** 3} GB")
+        dest = where[1] / fname
+        if dest.is_dir() or dest.is_symlink():
+            return fail(409, "a directory or link of that name is in the way")
+        replaced = dest.exists()
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=where[1], prefix=".upload-", delete=False) as h:
+                tmp = Path(h.name)
+                left = size
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise OSError("the upload stopped early")
+                    h.write(chunk)
+                    left -= len(chunk)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dest)
+        except OSError as e:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+            return fail(500, str(e))
+        self.send(json.dumps({"ok": True, "name": fname, "size": size, "replaced": replaced}).encode(), "application/json")
 
 
 def serve(root: Path, host: str, port: int) -> int:
@@ -145,8 +268,8 @@ def serve(root: Path, host: str, port: int) -> int:
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print(f"codex-loop web UI: http://{shown}:{port}/   (Ctrl+C to stop)", flush=True)
     if host not in ("127.0.0.1", "localhost", "::1"):
-        print("It has no login: anyone who can reach this address can read the goals, logs and command output.",
-              flush=True)
+        print("It has no login: anyone who can reach this address can read the goals, logs, command output and "
+              "the working directories' files, and upload files into them.", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -195,11 +318,22 @@ tr.row { cursor:pointer; } tr.row:hover td { background:var(--panel); }
 details { margin:8px 0; } summary { cursor:pointer; color:var(--accent); }
 .step { margin:6px 0; } .step .c { color:var(--accent); }
 .empty { color:var(--dim); padding:40px 0; }
+.bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:8px; }
+.crumbs { overflow-wrap:anywhere; flex:1 1 240px; }
+.crumbs a, td a { color:var(--accent); cursor:pointer; text-decoration:none; }
+button, .btn { font:inherit; padding:4px 12px; border:1px solid var(--line); border-radius:6px; background:var(--panel);
+       color:var(--text); cursor:pointer; }
+button:hover { border-color:var(--accent); }
+#files.drag .drop { border-color:var(--accent); background:var(--panel); }
+.drop { border:1px dashed var(--line); border-radius:6px; padding:8px 12px; color:var(--dim); font-size:13px; margin-top:8px; }
+td.name { white-space:normal; overflow-wrap:anywhere; }
+.pv img { max-width:100%; border:1px solid var(--line); border-radius:6px; }
+.pv pre { max-height:60vh; overflow:auto; }
 @media (max-width: 760px) { .app { grid-template-columns:1fr; height:auto; } aside { max-height:40vh; } }
 </style></head><body>
 <div class="app">
   <aside><h1>codex-loop tasks</h1><div id="list"></div></aside>
-  <main id="main"><div class="empty">No task selected.</div></main>
+  <main id="main"><div id="detail"><div class="empty">No task selected.</div></div><div id="files"></div></main>
 </div>
 <script>
 const $ = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
@@ -223,7 +357,8 @@ function renderList(tasks) {
     const d = $("div", "task" + (t.name === selected ? " sel" : ""));
     d.append(statusBadge(t), $("span", "meta", "updated " + ago(Date.now()/1000 - t.updated) + " ago"));
     d.append($("div", "g", t.goal || "(no goal)"), $("div", "meta", t.workspace));
-    d.onclick = () => { selected = t.name; location.hash = t.name; openRun = ""; refreshList(); refreshDetail(); };
+    d.onclick = () => { selected = t.name; location.hash = t.name; openRun = ""; dir = ""; shown = "";
+      refreshList(); refreshDetail(); refreshFiles(); };
     list.append(d);
   }
 }
@@ -249,7 +384,7 @@ async function showRun(name, tag, box) {
 
 async function refreshDetail() { if (selected) renderDetail(await get("/api/task?name=" + selected)); }
 function renderDetail(t) {
-  const main = document.getElementById("main");
+  const main = document.getElementById("detail");
   if (!t) { main.replaceChildren($("div", "empty", "This task's record is gone.")); return; }
   const liveBox = main.querySelector(".live");
   const keepScroll = main.scrollTop, stick = !liveBox || liveBox.scrollTop + liveBox.clientHeight >= liveBox.scrollHeight - 8;
@@ -314,10 +449,80 @@ function renderDetail(t) {
   main.scrollTop = keepScroll;
   const nl = main.querySelector(".live"); if (nl && stick) nl.scrollTop = nl.scrollHeight;
 }
+// ---- the working directory: browse, preview, upload ----
+let dir = "", shown = "", note = "";
+const size = n => n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1) + " KB" : n < 1073741824 ? (n/1048576).toFixed(1) + " MB" : (n/1073741824).toFixed(2) + " GB";
+const join = (a, b) => a ? a + "/" + b : b;
+const fq = (path) => `name=${encodeURIComponent(selected)}&path=${encodeURIComponent(path)}`;
+
+async function refreshFiles(first) {
+  const box = document.getElementById("files");
+  if (!selected) { box.replaceChildren(); return; }
+  const task = selected, l = first || await get("/api/files?" + fq(dir));
+  if (task !== selected) return;
+  const out = [section("Working directory")];
+  if (!l) { if (dir) { dir = ""; return refreshFiles(); }
+    out.push($("div", "meta", "The working directory cannot be read.")); box.replaceChildren(...out); return; }
+  const bar = $("div", "bar"), crumbs = $("div", "crumbs");
+  const go = (p) => { dir = p; shown = ""; note = ""; refreshFiles(); };
+  const root = $("a", "", "workspace"); root.onclick = () => go(""); crumbs.append(root);
+  let acc = ""; for (const part of l.path ? l.path.split("/") : []) { acc = join(acc, part); const p = acc;
+    const a = $("a", "", part); a.onclick = () => go(p); crumbs.append(" / ", a); }
+  const pick = $("input"); pick.type = "file"; pick.multiple = true; pick.hidden = true;
+  pick.onchange = () => upload(pick.files);
+  const up = $("button", "", "Upload files here"); up.onclick = () => pick.click();
+  bar.append(crumbs, up, pick); out.push(bar);
+  if (note) out.push($("div", "meta", note));
+  const wrap = $("div", "tablewrap"), tb = $("table");
+  const hr = $("tr"); hr.append($("th", "", "name"), $("th", "num", "size"), $("th", "", "modified")); tb.append(hr);
+  for (const e of l.entries) {
+    const tr = $("tr"), td = $("td", "name"), a = $("a", "", e.name + (e.dir ? "/" : ""));
+    a.onclick = () => { if (e.dir) go(join(l.path, e.name)); else { shown = shown === e.name ? "" : e.name; refreshFiles(); } };
+    td.append(a); tr.append(td, $("td", "num", e.dir ? "" : size(e.size)), $("td", "", e.mtime ? when(e.mtime) : ""));
+    tb.append(tr);
+    if (!e.dir && shown === e.name) { const x = $("tr"), c = $("td", "pv"); c.colSpan = 3; c.style.whiteSpace = "normal";
+      x.append(c); tb.append(x); showFile(join(l.path, e.name), c); }
+  }
+  if (!l.entries.length) { const tr = $("tr"), td = $("td", "meta", "This folder is empty."); td.colSpan = 3; tr.append(td); tb.append(tr); }
+  wrap.append(tb); out.push(wrap);
+  if (l.count > l.entries.length) out.push($("div", "meta", `Showing ${l.entries.length} of ${l.count} entries.`));
+  out.push($("div", "drop", "Drop files anywhere on this section to upload them into the folder shown. A file of the same name is replaced."));
+  box.replaceChildren(...out);
+}
+async function showFile(path, cell) {
+  const raw = "/raw?" + fq(path), p = await get("/api/file?" + fq(path));
+  cell.replaceChildren();
+  const dl = $("a", "", "Download"); dl.href = raw; dl.download = "";
+  if (!p) { cell.append($("span", "meta", "This file is gone.")); return; }
+  if (p.image) { const img = $("img"); img.src = raw; img.alt = path; cell.append(img, $("div"), dl); return; }
+  if (p.binary) { cell.append($("span", "meta", `Binary file, ${size(p.size)}. `), dl); return; }
+  cell.append($("pre", "", p.text), $("div", "meta", p.cut ? `Only the first part of ${size(p.size)} is shown. ` : ""), dl);
+}
+async function upload(files) {
+  const target = dir, task = selected; let done = 0, failed = [];
+  for (const f of files) {
+    note = `Uploading ${f.name} (${done + 1} of ${files.length}) …`; refreshFiles();
+    try {
+      const r = await fetch(`/api/upload?${fq(target)}&filename=${encodeURIComponent(f.name)}`,
+        { method: "POST", body: f, headers: { "X-Codex-Loop": "1" } });
+      if (r.ok) done++; else failed.push(f.name + ": " + ((await r.json()).error || r.status));
+    } catch (e) { failed.push(f.name + ": " + e.message); }
+  }
+  if (task !== selected) return;
+  note = `Uploaded ${done} of ${files.length} file(s) into ${target || "the workspace"}.` + (failed.length ? " Failed: " + failed.join("; ") : "");
+  refreshFiles();
+}
+const fb = document.getElementById("files");
+fb.addEventListener("dragover", e => { e.preventDefault(); fb.classList.add("drag"); });
+fb.addEventListener("dragleave", () => fb.classList.remove("drag"));
+fb.addEventListener("drop", e => { e.preventDefault(); fb.classList.remove("drag"); if (e.dataTransfer.files.length) upload(e.dataTransfer.files); });
+
 const BOOT = /*BOOT*/null;
 if (BOOT && BOOT.tasks.length && (!selected || selected === BOOT.tasks[0].name)) {
   selected = BOOT.tasks[0].name; renderList(BOOT.tasks); renderDetail(BOOT.task);
-} else { refreshList(); refreshDetail(); }
+  refreshFiles(BOOT.files);
+} else { refreshList(); refreshDetail(); refreshFiles(); }
+setInterval(() => { if (!document.hidden && !shown && !note.startsWith("Uploading") && !window.getSelection().toString()) refreshFiles(); }, 6000);
 setInterval(refreshList, 5000);
 setInterval(() => { if (!document.hidden && !window.getSelection().toString()) refreshDetail(); }, 2000);
 </script></body></html>

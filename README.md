@@ -71,17 +71,23 @@ when the output is not a terminal.
 codex-loop --web          # http://127.0.0.1:8790/
 ```
 
-A read-only page with every task on the left and, for the selected one: the goal and
-status, the latest progress (the same stream as the terminal view, refreshed every two
+A page with every task on the left and, for the selected one: the goal and status,
+the latest progress (the same stream as the terminal view, refreshed every two
 seconds), the latest evaluation per criterion, and the record of every conversation
 with its duration and token counts. Click a conversation to see the commands it ran
 and what it said.
 
+Below that is the task's working directory: browse folders, preview text and images,
+download any file, and upload files into the folder shown (button or drag and drop;
+a file of the same name is replaced, up to 2 GB each). The page cannot reach anything
+outside the working directory, and it cannot delete or rename.
+
 Task records are kept in `~/.codex-loop/tasks/`, so the list survives a reboot; the
 details of a task (progress, conversations, state) are read from its `/tmp` directory
 and disappear with it. `--web-host 0.0.0.0` makes the page reachable from other
-machines; it has no login, so anyone who can reach it can read goals, logs and command
-output. `--web-port` changes the port.
+machines. It has no login: anyone who can reach it can read goals, logs, command output
+and the working directories' files, and can upload files into them, where a running
+agent may pick them up. `--web-port` changes the port.
 
 ## No long context
 
