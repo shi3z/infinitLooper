@@ -33,6 +33,24 @@ codex-loop "Add a /health endpoint with tests; the whole test suite must pass."
   means the goal was met, 2 that a limit was reached. State is on disk, so running
   `codex-loop` with no goal resumes.
 
+## Watching it work
+
+On a terminal the harness shows a status line and the newest three lines of what the
+model is doing, redrawn in place:
+
+```
+| worker #2  01:15  ~5165 tokens streamed  last activity 1s ago
+[think] The parser rejects "2 3" but accepts "(2)(3)"; that needs a check for
+$ /bin/bash -lc 'python3 -m unittest 2>&1 | tail -n 5'
+  > exit 0: OK
+```
+
+The text is the model's own token stream (reasoning, answers, tool-call arguments)
+plus the commands Codex runs and the last line of their output. Codex prints only
+finished items, so the harness puts a small local pass-through in front of the model
+server and reads the stream there. `--no-live` turns the view off; it is also off
+when the output is not a terminal.
+
 ## No long context
 
 The design follows [You don't need long context](https://arxiv.org/abs/2611.05306)
@@ -62,7 +80,8 @@ ln -s "$PWD/infinitLooper/bin/codex-loop" ~/.local/bin/codex-loop
 The default target is an OpenAI-compatible server with the Responses API at
 `http://127.0.0.1:8080/v1`, which is what a local
 [Strata](https://github.com/Niko1221/Strata) server provides. The harness writes its
-own Codex configuration to `~/.codex-loop/home` and leaves `~/.codex` alone.
+own Codex configuration to `.codex-loop/codex-home` in the workspace and leaves
+`~/.codex` alone, so several loops can run at once in different directories.
 
 | Environment variable | Meaning |
 | --- | --- |
@@ -91,6 +110,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--iter-timeout` | 3600 | seconds one conversation may take |
 | `--max-iters`, `--max-hours` | 0 | limits; 0 means run until the goal is met |
 | `--stuck-after` | 3 | unchanged iterations before the change-approach notice |
+| `--no-live` | | no live view |
 
 Files in `.codex-loop/`: `GOAL.md`, `CRITERIA.md`, `STATE.md`, `EVAL.md`, `log.jsonl`
 (one row per conversation with token usage, and every verdict) and `runs/` (the

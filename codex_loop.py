@@ -21,13 +21,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
+import http.server
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import unicodedata
+import urllib.parse
 from pathlib import Path
 
 STATE_DIR = ".codex-loop"
@@ -153,6 +158,166 @@ def log(msg: str) -> None:
     print(f"[codex-loop {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def char_width(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+class Live:
+    """A status line and the newest three lines of what the model is doing, redrawn in place.
+
+    Text arrives from two sides: the model's token stream (through StreamTap) and Codex's
+    own events (commands it runs). Off when stdout is not a terminal.
+    """
+
+    ROWS = 3
+    LABEL = {"think": "[think] ", "say": "[say] ", "tool": "[call] ", "cmd": "$ ", "out": "  > ", "edit": "[edit] "}
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled and sys.stdout.isatty()
+        self.lock = threading.Lock()
+        self.text = ""
+        self.kind = ""
+        self.chunks = 0
+        self.last = time.time()
+        self.t0 = time.time()
+        self.title = ""
+        self.drawn = False
+        self.streaming = False  # True once the token stream is seen: Codex's message items would repeat it
+
+    def begin(self, title: str) -> None:
+        with self.lock:
+            self.text, self.kind, self.chunks, self.title = "", "", 0, title
+            self.t0 = self.last = time.time()
+
+    def feed(self, kind: str, text: str, delta: bool = False) -> None:
+        if not text:
+            return
+        with self.lock:
+            if kind != self.kind or not delta:
+                self.text += ("\n" if self.text and not self.text.endswith("\n") else "") + self.LABEL.get(kind, "")
+                self.kind = kind
+            self.text = (self.text + text)[-6000:]
+            self.chunks += 1 if delta else 0
+            self.last = time.time()
+
+    def rows(self, width: int) -> list[str]:
+        out: list[str] = []
+        for line in self.text.split("\n")[-12:]:
+            line = "".join(c if c.isprintable() else " " for c in line).rstrip()
+            if not line:
+                continue
+            row, w = "", 0
+            for ch in line:
+                cw = char_width(ch)
+                if w + cw > width:
+                    out.append(row)
+                    row, w = "", 0
+                row += ch
+                w += cw
+            out.append(row)
+        out = out[-self.ROWS:]
+        return out + [""] * (self.ROWS - len(out))
+
+    def draw(self) -> None:
+        if not self.enabled:
+            return
+        width = max(20, shutil.get_terminal_size((100, 24)).columns - 1)
+        with self.lock:
+            now = time.time()
+            el = int(now - self.t0)
+            spin = "|/-\\"[int(now * 5) % 4]
+            status = (f"{spin} {self.title}  {el // 60:02d}:{el % 60:02d}  ~{self.chunks} tokens streamed  "
+                      f"last activity {int(now - self.last)}s ago")[:width]
+            lines = [status] + self.rows(width)
+        buf = f"\x1b[{len(lines)}A" if self.drawn else ""
+        buf += "".join(f"\x1b[2K{line}\n" for line in lines)
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+        self.drawn = True
+
+    def end(self) -> None:
+        if self.enabled and self.drawn:
+            n = self.ROWS + 1
+            sys.stdout.write(f"\x1b[{n}A" + "\x1b[2K\n" * n + f"\x1b[{n}A")
+            sys.stdout.flush()
+        self.drawn = False
+
+
+class StreamTap(http.server.ThreadingHTTPServer):
+    """A local pass-through in front of the model server, so the token stream can be watched.
+
+    Codex prints whole items only; the tokens themselves are visible just on the wire. Requests
+    and responses are forwarded unchanged; server-sent `*.delta` events are also fed to Live.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, upstream: str, live: Live) -> None:
+        self.up = urllib.parse.urlsplit(upstream)
+        self.live = live
+        super().__init__(("127.0.0.1", 0), TapHandler)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}{self.up.path}"
+
+
+class TapHandler(http.server.BaseHTTPRequestHandler):
+    HOP = {"host", "connection", "accept-encoding", "content-length", "transfer-encoding", "keep-alive", "upgrade"}
+
+    def log_message(self, *_: object) -> None:
+        pass
+
+    def relay(self) -> None:
+        srv: StreamTap = self.server  # type: ignore[assignment]
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in self.HOP}
+        cls = http.client.HTTPSConnection if srv.up.scheme == "https" else http.client.HTTPConnection
+        try:
+            conn = cls(srv.up.netloc, timeout=1800)
+            conn.request(self.command, self.path, body=body or None, headers=headers)
+            resp = conn.getresponse()
+        except OSError as e:
+            self.send_error(502, f"codex-loop: model server unreachable: {e}")
+            return
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() not in ("connection", "content-length", "transfer-encoding", "keep-alive"):
+                self.send_header(k, v)
+        self.send_header("Connection", "close")  # HTTP/1.0 framing: the body ends when the socket closes
+        self.end_headers()
+        try:
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                self.wfile.write(line)
+                if line in (b"\n", b"\r\n"):
+                    self.wfile.flush()
+                elif line.startswith(b"data:"):
+                    self.watch(srv.live, line[5:])
+            self.wfile.flush()
+        except OSError:
+            pass  # Codex went away (cancel, timeout): nothing to forward to
+        finally:
+            conn.close()
+
+    @staticmethod
+    def watch(live: Live, data: bytes) -> None:
+        try:
+            ev = json.loads(data)
+        except ValueError:
+            return
+        kind = ev.get("type", "") if isinstance(ev, dict) else ""
+        delta = ev.get("delta") if kind.endswith(".delta") else None
+        if isinstance(delta, str):
+            live.streaming = True
+            live.feed("think" if "reasoning" in kind else "say" if "output_text" in kind else "tool", delta, delta=True)
+
+    do_GET = do_POST = do_PUT = do_DELETE = relay
+
+
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
 
@@ -161,9 +326,10 @@ def toml_str(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
-def write_codex_home(args: argparse.Namespace) -> Path:
-    """A private CODEX_HOME so the user's own ~/.codex is never read or changed."""
-    home = Path(args.codex_home).expanduser()
+def write_codex_home(args: argparse.Namespace, default: Path) -> Path:
+    """A private CODEX_HOME per workspace: the user's ~/.codex is never read or changed, and two
+    loops running at once do not overwrite each other's settings."""
+    home = Path(args.codex_home).expanduser() if args.codex_home else default
     home.mkdir(parents=True, exist_ok=True)
     cfg = [
         f"model = {toml_str(args.model)}",
@@ -214,6 +380,29 @@ class Loop:
         self.env = dict(os.environ)
         self.totals = {"conversations": 0, "input_tokens": 0, "output_tokens": 0}
         self.child: subprocess.Popen | None = None
+        self.live = Live(not args.no_live)
+
+    def watch_events(self, pipe, sink) -> None:
+        """Copy Codex's JSONL events to the run file, and show the commands it runs."""
+        for line in pipe:
+            sink.write(line)
+            sink.flush()
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            it = e.get("item") or {}
+            kind, started = it.get("type"), e.get("type") == "item.started"
+            if kind == "command_execution":
+                if started:
+                    self.live.feed("cmd", " ".join(str(it.get("command", "")).split()))
+                else:
+                    tail = [x for x in str(it.get("aggregated_output", "")).splitlines() if x.strip()][-1:]
+                    self.live.feed("out", f"exit {it.get('exit_code')}" + (f": {tail[0].strip()}" if tail else ""))
+            elif kind == "file_change" and started:
+                self.live.feed("edit", ", ".join(str(c.get("path", "")) for c in it.get("changes") or []))
+            elif kind in ("agent_message", "reasoning") and not started and not self.live.streaming:
+                self.live.feed("say" if kind == "agent_message" else "think", str(it.get("text", "")))
 
     # ---- one fresh Codex conversation -------------------------------------
     def codex(self, role: str, n: int, prompt: str, sandbox: str, schema: Path | None = None) -> str:
@@ -234,15 +423,23 @@ class Loop:
         usage = {}
         try:
             with open(events, "w") as ev, open(self.runs / f"{tag}.stderr.txt", "w") as err:
-                self.child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=ev, stderr=err,
-                                              env=self.env, start_new_session=True)
+                self.child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
+                                              env=self.env, start_new_session=True, text=True, errors="replace")
+                self.live.begin(f"{role} #{n}")
+                reader = threading.Thread(target=self.watch_events, args=(self.child.stdout, ev), daemon=True)
+                reader.start()
                 try:
-                    rc = self.child.wait(timeout=self.a.iter_timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(self.child.pid, signal.SIGKILL)
-                    self.child.wait()
-                    rc = "timeout"
+                    while (rc := self.child.poll()) is None:
+                        if time.time() - t0 > self.a.iter_timeout:
+                            os.killpg(self.child.pid, signal.SIGKILL)
+                            self.child.wait()
+                            rc = "timeout"
+                            break
+                        self.live.draw()
+                        time.sleep(0.2)
+                    reader.join(timeout=10)
                 finally:
+                    self.live.end()
                     self.child = None
         except OSError as e:
             log(f"{role}: could not start codex: {e}")
@@ -314,6 +511,7 @@ class Loop:
             if not (self.sd / name).exists():
                 (self.sd / name).write_text(text)
         (self.sd / "verdict.schema.json").write_text(json.dumps(VERDICT_SCHEMA))
+        self.env["CODEX_HOME"] = str(write_codex_home(self.a, self.sd / "codex-home"))
 
     def plan(self) -> None:
         crit = self.sd / "CRITERIA.md"
@@ -412,6 +610,7 @@ class Loop:
                 return 0
 
     def stop(self, *_: object) -> None:
+        self.live.end()
         if self.child is not None:
             try:
                 os.killpg(self.child.pid, signal.SIGTERM)
@@ -428,8 +627,8 @@ def main() -> int:
     p.add_argument("-C", "--workspace", default=".", help="directory the agent works in (default: .)")
     p.add_argument("--restart", action="store_true", help="discard this workspace's loop state and start over")
     p.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
-    p.add_argument("--codex-home", default="~/.codex-loop/home",
-                   help="private CODEX_HOME written by the harness (default: %(default)s)")
+    p.add_argument("--codex-home",
+                   help="private CODEX_HOME written by the harness (default: .codex-loop/codex-home in the workspace)")
     p.add_argument("--model", default="strata")
     p.add_argument("--base-url", default="http://127.0.0.1:8080/v1",
                    help="OpenAI-compatible server; pass '' to use Codex's built-in OpenAI provider")
@@ -445,6 +644,9 @@ def main() -> int:
     p.add_argument("--iter-timeout", type=int, default=3600, help="seconds one conversation may take")
     p.add_argument("--max-iters", type=int, default=0, help="stop after this many iterations (0 = until the goal is met)")
     p.add_argument("--max-hours", type=float, default=0, help="stop after this long (0 = until the goal is met)")
+    p.add_argument("--no-live", action="store_true",
+                   help="no live view (it is shown only on a terminal: a status line and the newest three lines "
+                        "of the model's stream and commands)")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
     a = p.parse_args()
@@ -455,7 +657,8 @@ def main() -> int:
     if shutil.which(a.codex_bin) is None:
         sys.exit(f"codex binary not found: {a.codex_bin} (use --codex-bin or CODEX_BIN)")
     loop = Loop(a)
-    loop.env["CODEX_HOME"] = str(write_codex_home(a))
+    if a.base_url and loop.live.enabled:
+        a.base_url = StreamTap(a.base_url, loop.live).url  # Codex talks to the tap, the tap to the server
     loop.env.setdefault(a.api_key_env, "local")
     signal.signal(signal.SIGINT, loop.stop)
     signal.signal(signal.SIGTERM, loop.stop)
