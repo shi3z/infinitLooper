@@ -49,8 +49,8 @@ with the goal.
 
 ## Watching it work
 
-On a terminal the harness shows a status line and the newest three lines of what the
-model is doing, redrawn in place:
+On a terminal the harness shows a status line and the newest ten lines of what the
+model is doing, redrawn in place (`--live-rows N` changes the number):
 
 ```
 | worker #2  01:15  ~5165 tokens streamed  last activity 1s ago
@@ -124,6 +124,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--iter-timeout` | 3600 | seconds one conversation may take |
 | `--max-iters`, `--max-hours` | 0 | limits; 0 means run until the goal is met |
 | `--stuck-after` | 3 | unchanged iterations before the change-approach notice |
+| `--live-rows` | 10 | lines of the live view |
 | `--no-live` | | no live view |
 | `--state`, `--tmp-dir` | remembered, `/tmp` | the context directory, and where a new one is created |
 

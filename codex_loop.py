@@ -165,16 +165,16 @@ def char_width(ch: str) -> int:
 
 
 class Live:
-    """A status line and the newest three lines of what the model is doing, redrawn in place.
+    """A status line and the newest lines (ten by default) of what the model is doing, redrawn in place.
 
     Text arrives from two sides: the model's token stream (through StreamTap) and Codex's
     own events (commands it runs). Off when stdout is not a terminal.
     """
 
-    ROWS = 3
     LABEL = {"think": "[think] ", "say": "[say] ", "tool": "[call] ", "cmd": "$ ", "out": "  > ", "edit": "[edit] "}
 
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, rows: int = 10) -> None:
+        self.ROWS = max(1, rows)
         self.enabled = enabled and sys.stdout.isatty()
         self.lock = threading.Lock()
         self.text = ""
@@ -204,7 +204,7 @@ class Live:
 
     def rows(self, width: int) -> list[str]:
         out: list[str] = []
-        for line in self.text.split("\n")[-12:]:
+        for line in self.text.split("\n")[-4 * self.ROWS:]:
             line = "".join(c if c.isprintable() else " " for c in line).rstrip()
             if not line:
                 continue
@@ -382,7 +382,7 @@ class Loop:
         self.env = dict(os.environ)
         self.totals = {"conversations": 0, "input_tokens": 0, "output_tokens": 0}
         self.child: subprocess.Popen | None = None
-        self.live = Live(not args.no_live)
+        self.live = Live(not args.no_live, args.live_rows)
 
     def watch_events(self, pipe, sink) -> None:
         """Copy Codex's JSONL events to the run file, and show the commands it runs."""
@@ -686,8 +686,9 @@ def main() -> int:
     p.add_argument("--max-iters", type=int, default=0, help="stop after this many iterations (0 = until the goal is met)")
     p.add_argument("--max-hours", type=float, default=0, help="stop after this long (0 = until the goal is met)")
     p.add_argument("--no-live", action="store_true",
-                   help="no live view (it is shown only on a terminal: a status line and the newest three lines "
+                   help="no live view (it is shown only on a terminal: a status line and the newest lines "
                         "of the model's stream and commands)")
+    p.add_argument("--live-rows", type=int, default=10, help="lines of the live view (default: %(default)s)")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
     a = p.parse_args()
