@@ -168,7 +168,8 @@ class Live:
     """A status line and the newest lines (ten by default) of what the model is doing, redrawn in place.
 
     Text arrives from two sides: the model's token stream (through StreamTap) and Codex's
-    own events (commands it runs). Off when stdout is not a terminal.
+    own events (commands it runs). Drawn only when stdout is a terminal; the same text is
+    also written to live.json in the state directory about once a second, for the web UI.
     """
 
     LABEL = {"think": "[think] ", "say": "[say] ", "tool": "[call] ", "cmd": "$ ", "out": "  > ", "edit": "[edit] "}
@@ -184,6 +185,8 @@ class Live:
         self.t0 = time.time()
         self.title = ""
         self.drawn = False
+        self.path: Path | None = None  # live.json
+        self.dumped = 0.0
         self.streaming = False  # True once the token stream is seen: Codex's message items would repeat it
 
     def begin(self, title: str) -> None:
@@ -202,9 +205,10 @@ class Live:
             self.chunks += 1 if delta else 0
             self.last = time.time()
 
-    def rows(self, width: int) -> list[str]:
+    def rows(self, width: int, count: int = 0) -> list[str]:
+        count = count or self.ROWS
         out: list[str] = []
-        for line in self.text.split("\n")[-4 * self.ROWS:]:
+        for line in self.text.split("\n")[-4 * count:]:
             line = "".join(c if c.isprintable() else " " for c in line).rstrip()
             if not line:
                 continue
@@ -217,10 +221,28 @@ class Live:
                 row += ch
                 w += cw
             out.append(row)
-        out = out[-self.ROWS:]
-        return out + [""] * (self.ROWS - len(out))
+        out = out[-count:]
+        return out + [""] * (count - len(out))
+
+    def dump(self, active: bool = True) -> None:
+        now = time.time()
+        if self.path is None or (active and now - self.dumped < 1):
+            return
+        self.dumped = now
+        with self.lock:
+            data = {"active": active, "title": self.title, "started": self.t0, "last": self.last, "time": now,
+                    "chunks": self.chunks,  # whole lines: the browser wraps them itself
+                    "lines": ["".join(c if c.isprintable() else " " for c in x)[-2000:]
+                              for x in self.text.split("\n")[-40:] if x.strip()]}
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
     def draw(self) -> None:
+        self.dump()
         if not self.enabled:
             return
         width = max(20, shutil.get_terminal_size((100, 24)).columns - 1)
@@ -238,6 +260,7 @@ class Live:
         self.drawn = True
 
     def end(self) -> None:
+        self.dump(active=False)
         if self.enabled and self.drawn:
             n = self.ROWS + 1
             sys.stdout.write(f"\x1b[{n}A" + "\x1b[2K\n" * n + f"\x1b[{n}A")
@@ -422,6 +445,7 @@ class Loop:
             cmd += ["--output-schema", str(schema)]
         cmd.append(prompt)
         t0 = time.time()
+        self.task(phase=role, iteration=n)
         usage = {}
         try:
             with open(events, "w") as ev, open(self.runs / f"{tag}.stderr.txt", "w") as err:
@@ -456,16 +480,41 @@ class Loop:
         self.totals["conversations"] += 1
         self.totals["input_tokens"] += int(usage.get("input_tokens", 0))
         self.totals["output_tokens"] += int(usage.get("output_tokens", 0))
+        self.add_tokens(usage)
         self.record({"iteration": n, "role": role, "rc": rc, "seconds": round(time.time() - t0, 1),
                      "usage": usage})
         log(f"{role}: rc={rc}, {time.time() - t0:.0f}s, in={usage.get('input_tokens', '?')} "
             f"out={usage.get('output_tokens', '?')} tokens")
         return last.read_text(errors="replace") if last.exists() else ""
 
+    def add_tokens(self, usage: dict) -> None:
+        path = REGISTRY.parent / "tasks" / f"{self.sd.name}.json"
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        self.task(input_tokens=data.get("input_tokens", 0) + int(usage.get("input_tokens", 0)),
+                  output_tokens=data.get("output_tokens", 0) + int(usage.get("output_tokens", 0)))
+
     def rules(self) -> str:
         return (f"The project is the working directory `{self.ws}`: all work and every check happens there, and "
                 f"relative paths in the goal mean that directory. `{self.sd}` holds only the loop's notes "
                 f"(goal, criteria, state, verdict); never put project files in it.\n\n" + COMMON_RULES)
+
+    def task(self, **fields: object) -> None:
+        """The task's record in ~/.codex-loop/tasks/: it outlives /tmp and is what the web UI lists."""
+        path = REGISTRY.parent / "tasks" / f"{self.sd.name}.json"
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {"name": self.sd.name, "started": time.time()}
+        data.setdefault("input_tokens", 0)
+        data.setdefault("output_tokens", 0)
+        data.update(fields, updated=time.time(), pid=os.getpid(), state=str(self.sd), workspace=str(self.ws))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        os.replace(tmp, path)
 
     def record(self, row: dict) -> None:
         row["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -543,6 +592,8 @@ class Loop:
         elif not goal.exists():
             sys.exit(f"{self.sd} has no GOAL.md: nothing to resume.")
         log(f"context: {self.sd}")
+        self.live.path = self.sd / "live.json"
+        self.task(goal=goal.read_text(errors="replace").strip(), status="running", phase="starting", ended=None)
         shutil.copyfile(goal, self.sd / "frozen" / "GOAL.md")
         for name, text in (("STATE.md", "(first iteration: nothing has been done yet)\n"),
                            ("EVAL.md", "(no evaluation yet)\n")):
@@ -597,6 +648,7 @@ class Loop:
         passed = sum(1 for c in crits if c.get("pass"))
         log(f"evaluation: {passed}/{len(crits)} criteria pass, done={verdict['done']}")
         self.record({"iteration": n, "role": "verdict", "verdict": verdict})
+        self.task(passed=passed, criteria=len(crits), done=verdict["done"])
         return verdict
 
     def run(self) -> int:
@@ -611,9 +663,11 @@ class Loop:
             n += 1
             if self.a.max_iters and n - done_iters > self.a.max_iters:
                 log(f"stopped: --max-iters {self.a.max_iters} reached, goal not met")
+                self.task(status="stopped", ended="max-iters reached", phase="")
                 return 2
             if self.a.max_hours and time.time() - started > self.a.max_hours * 3600:
                 log(f"stopped: --max-hours {self.a.max_hours} reached, goal not met")
+                self.task(status="stopped", ended="max-hours reached", phase="")
                 return 2
             log(f"=== iteration {n} ===")
             fp, st = self.workspace_fingerprint(), sha(self.sd / "STATE.md")
@@ -646,10 +700,13 @@ class Loop:
                 t = self.totals
                 log(f"GOAL MET after {n} iteration(s), {t['conversations']} conversations, "
                     f"{t['input_tokens']} input / {t['output_tokens']} output tokens this run")
+                self.task(status="done", ended="goal met", phase="")
                 return 0
 
     def stop(self, *_: object) -> None:
         self.live.end()
+        if self.sd != Path():
+            self.task(status="stopped", ended="interrupted", phase="")
         if self.child is not None:
             try:
                 os.killpg(self.child.pid, signal.SIGTERM)
@@ -689,9 +746,16 @@ def main() -> int:
                    help="no live view (it is shown only on a terminal: a status line and the newest lines "
                         "of the model's stream and commands)")
     p.add_argument("--live-rows", type=int, default=10, help="lines of the live view (default: %(default)s)")
+    p.add_argument("--web", action="store_true", help="serve the web UI (task records and live progress) and do nothing else")
+    p.add_argument("--web-host", default="127.0.0.1", help="address the web UI listens on (default: %(default)s)")
+    p.add_argument("--web-port", type=int, default=8765, help="port of the web UI (default: %(default)s)")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
     a = p.parse_args()
+    if a.web:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))  # found even under `python3 -I`
+        import codex_loop_web
+        return codex_loop_web.serve(REGISTRY.parent / "tasks", a.web_host, a.web_port)
     if a.goal_file:
         a.goal = Path(a.goal_file).read_text()
     if not a.compact_at:
@@ -699,7 +763,7 @@ def main() -> int:
     if shutil.which(a.codex_bin) is None:
         sys.exit(f"codex binary not found: {a.codex_bin} (use --codex-bin or CODEX_BIN)")
     loop = Loop(a)
-    if a.base_url and loop.live.enabled:
+    if a.base_url and not a.no_live:
         a.base_url = StreamTap(a.base_url, loop.live).url  # Codex talks to the tap, the tap to the server
     loop.env.setdefault(a.api_key_env, "local")
     signal.signal(signal.SIGINT, loop.stop)

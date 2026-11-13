@@ -65,6 +65,24 @@ finished items, so the harness puts a small local pass-through in front of the m
 server and reads the stream there. `--no-live` turns the view off; it is also off
 when the output is not a terminal.
 
+## Web UI
+
+```sh
+codex-loop --web          # http://127.0.0.1:8765/
+```
+
+A read-only page with every task on the left and, for the selected one: the goal and
+status, the latest progress (the same stream as the terminal view, refreshed every two
+seconds), the latest evaluation per criterion, and the record of every conversation
+with its duration and token counts. Click a conversation to see the commands it ran
+and what it said.
+
+Task records are kept in `~/.codex-loop/tasks/`, so the list survives a reboot; the
+details of a task (progress, conversations, state) are read from its `/tmp` directory
+and disappear with it. `--web-host 0.0.0.0` makes the page reachable from other
+machines; it has no login, so anyone who can reach it can read goals, logs and command
+output. `--web-port` changes the port.
+
 ## No long context
 
 The design follows [You don't need long context](https://arxiv.org/abs/2611.05306)
@@ -126,6 +144,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--stuck-after` | 3 | unchanged iterations before the change-approach notice |
 | `--live-rows` | 10 | lines of the live view |
 | `--no-live` | | no live view |
+| `--web`, `--web-host`, `--web-port` | off, `127.0.0.1`, 8765 | serve the web UI instead of running a loop |
 | `--state`, `--tmp-dir` | remembered, `/tmp` | the context directory, and where a new one is created |
 
 ## Status
