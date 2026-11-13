@@ -22,7 +22,13 @@ NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 MAX_TEXT = 40_000
 MAX_PREVIEW = 300_000
 MAX_UPLOAD = 2 * 1024 ** 3
-INLINE = ("image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf")
+IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+          ".webp": "image/webp", ".avif": "image/avif", ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+VIDEOS = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+          ".ogv": "video/ogg"}
+MEDIA = {**IMAGES, **VIDEOS}
+INLINE = set(MEDIA.values()) | {"application/pdf"}
+MAX_SCAN = 50_000
 
 
 def read(path: Path, limit: int = MAX_TEXT) -> str:
@@ -134,13 +140,45 @@ def listing(ws: Path, d: Path) -> dict | None:
     return {"path": str(d.relative_to(ws)) if d != ws else "", "entries": entries[:5000], "count": len(entries)}
 
 
+def media(ws: Path, d: Path, recursive: bool, newest: bool, page: int, per: int) -> dict | None:
+    """One page of the pictures and videos in a folder (optionally with its subfolders)."""
+    if not d.is_dir():
+        return None
+    found, scanned = [], 0
+    for root, dirs, files in os.walk(d):
+        dirs[:] = sorted(x for x in dirs if not x.startswith(".") and x not in ("node_modules", "__pycache__"))
+        for f in files:
+            scanned += 1
+            ext = os.path.splitext(f)[1].lower()
+            if ext in MEDIA:
+                full = Path(root) / f
+                try:
+                    st = full.stat()
+                except OSError:
+                    continue
+                found.append({"path": str(full.relative_to(ws)), "name": f, "size": st.st_size, "mtime": st.st_mtime,
+                              "video": ext in VIDEOS})
+        if not recursive or scanned > MAX_SCAN:
+            break
+    found.sort(key=(lambda x: -x["mtime"]) if newest else (lambda x: x["path"].lower()))
+    per = max(1, min(per, 200))
+    pages = max(1, -(-len(found) // per))
+    page = max(1, min(page, pages))
+    return {"path": str(d.relative_to(ws)) if d != ws else "", "total": len(found), "page": page, "pages": pages,
+            "per": per, "items": found[(page - 1) * per: page * per], "cut": scanned > MAX_SCAN}
+
+
+def kind_of(f: Path) -> str:
+    return MEDIA.get(f.suffix.lower()) or mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+
+
 def preview(f: Path) -> dict | None:
     if not f.is_file():
         return None
     size = f.stat().st_size
-    kind = mimetypes.guess_type(f.name)[0] or ""
-    if kind.startswith("image/"):
-        return {"size": size, "image": True}
+    ext = f.suffix.lower()
+    if ext in MEDIA:
+        return {"size": size, "image": ext in IMAGES, "video": ext in VIDEOS}
     with open(f, "rb") as h:
         head = h.read(MAX_PREVIEW)
     if b"\0" in head[:8000]:
@@ -169,11 +207,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data: object = None
         if url.path == "/":
             # The newest task is drawn with the page itself, so there is no empty first paint.
+            # `/?task=NAME&dir=FOLDER&view=gallery` opens that task at that folder, with the gallery showing.
             ts = tasks(self.root)
-            boot = {"tasks": ts, "task": detail(self.root, ts[0]["name"]) if ts else None, "files": None}
-            where = inside(self.root, ts[0]["name"], "") if ts else None
+            want = q.get("task", "")
+            first = want if any(t["name"] == want for t in ts) else ts[0]["name"] if ts else ""
+            boot = {"tasks": ts, "name": first, "task": detail(self.root, first) if first else None,
+                    "files": None, "media": None}
+            where = inside(self.root, first, q.get("dir", "")) if first else None
             if where:
                 boot["files"] = listing(*where)
+                if q.get("view") == "gallery":
+                    boot["media"] = media(*where, False, False, 1, 48)
             blob = json.dumps(boot, ensure_ascii=False).replace("</", "<\\/")
             return self.send(PAGE.replace("/*BOOT*/null", blob).encode(), "text/html; charset=utf-8")
         if url.path == "/api/tasks":
@@ -182,11 +226,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = detail(self.root, name)
         elif url.path == "/api/run" and NAME.match(name):
             data = run(self.root, name, q.get("tag", ""))
-        elif url.path in ("/api/files", "/api/file", "/raw"):
+        elif url.path in ("/api/files", "/api/file", "/api/media", "/raw"):
             where = inside(self.root, name, q.get("path", ""))
             if where and url.path == "/raw":
                 return self.raw(where[1])
-            if where:
+            if where and url.path == "/api/media":
+                num = lambda k, d: int(q[k]) if q.get(k, "").isdigit() else d  # noqa: E731
+                data = media(*where, q.get("recursive") == "1", q.get("sort") == "newest", num("page", 1), num("per", 48))
+            elif where:
                 data = listing(*where) if url.path == "/api/files" else preview(where[1])
         if data is None:
             return self.send(b'{"error": "not found"}', "application/json", 404)
@@ -196,20 +243,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def raw(self, f: Path) -> None:
         if not f.is_file():
             return self.send(b"not found", "text/plain", 404)
-        kind = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        self.send_response(200)
+        kind, total = kind_of(f), f.stat().st_size
+        start, end = 0, total - 1
+        m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
+        partial = bool(m and (m.group(1) or m.group(2)))
+        if partial:  # videos are played by asking for byte ranges
+            if m.group(1):
+                start, end = int(m.group(1)), min(int(m.group(2) or end), end)
+            else:
+                start = max(0, total - int(m.group(2)))
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{total}")
+                self.end_headers()
+                return
+        self.send_response(206 if partial else 200)
         # Files come from the agent and from uploads: never let one run as a page of this site.
         self.send_header("Content-Type", kind if kind in INLINE else "application/octet-stream")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "sandbox")
         disp = "inline" if kind in INLINE else "attachment"
         self.send_header("Content-Disposition", f"{disp}; filename*=UTF-8\'\'{urllib.parse.quote(f.name)}")
-        self.send_header("Content-Length", str(f.stat().st_size))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Cache-Control", "private, max-age=60")
         self.end_headers()
         try:
             with open(f, "rb") as h:
-                while chunk := h.read(1 << 20):
+                h.seek(start)
+                left = end - start + 1
+                while left > 0 and (chunk := h.read(min(left, 1 << 20))):
                     self.wfile.write(chunk)
+                    left -= len(chunk)
         except OSError:
             pass
 
@@ -329,20 +396,44 @@ button:hover { border-color:var(--accent); }
 td.name { white-space:normal; overflow-wrap:anywhere; }
 .pv img { max-width:100%; border:1px solid var(--line); border-radius:6px; }
 .pv pre { max-height:60vh; overflow:auto; }
+.pv video { max-width:100%; max-height:70vh; }
+button.on { border-color:var(--accent); color:var(--accent); }
+button:disabled { opacity:.45; cursor:default; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:10px; }
+.cell { background:var(--panel); border:1px solid var(--line); border-radius:6px; overflow:hidden; cursor:pointer; }
+.cell:hover { border-color:var(--accent); }
+.thumb { aspect-ratio:1; background:var(--code); display:flex; align-items:center; justify-content:center; position:relative; }
+.thumb img, .thumb video { width:100%; height:100%; object-fit:cover; display:block; }
+.thumb .play { position:absolute; right:6px; bottom:6px; background:#000a; color:#fff; border-radius:4px; padding:0 6px; font-size:12px; }
+.cap { padding:4px 8px; font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pager { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:10px 0; }
+.pager select, .pager label { font:inherit; color:var(--text); }
+#box { position:fixed; inset:0; background:#000d; display:none; flex-direction:column; align-items:center; justify-content:center; z-index:10; }
+#box.open { display:flex; }
+#box img, #box video { max-width:94vw; max-height:84vh; }
+#box .t { color:#eee; margin-top:10px; max-width:94vw; overflow-wrap:anywhere; text-align:center; }
+#box .t a { color:#9cc0ff; }
+#box button { position:fixed; top:50%; transform:translateY(-50%); background:#0008; color:#fff; border-color:#fff5; font-size:22px; padding:10px 14px; }
+#box .prev { left:10px; } #box .next { right:10px; } #box .close { top:26px; right:10px; font-size:16px; }
 @media (max-width: 760px) { .app { grid-template-columns:1fr; height:auto; } aside { max-height:40vh; } }
 </style></head><body>
 <div class="app">
   <aside><h1>codex-loop tasks</h1><div id="list"></div></aside>
   <main id="main"><div id="detail"><div class="empty">No task selected.</div></div><div id="files"></div></main>
+<div id="box"><button class="close">Close</button><button class="prev" aria-label="Previous">‹</button><button class="next" aria-label="Next">›</button><div class="m"></div><div class="t"></div></div>
 </div>
 <script>
+const oops = m => { const d = document.createElement("div"); d.className = "fail"; d.textContent = "Page error: " + m; document.getElementById("main").prepend(d); };
+window.addEventListener("error", e => oops(e.message + " (line " + e.lineno + ")"));
+window.addEventListener("unhandledrejection", e => oops(e.reason && e.reason.message || e.reason));
 const $ = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
   if (text !== undefined) e.textContent = text; return e; };
 const ago = s => { s = Math.max(0, Math.round(s)); if (s < 90) return s + " s"; if (s < 5400) return Math.round(s/60) + " min";
   if (s < 129600) return Math.round(s/3600) + " h"; return Math.round(s/86400) + " d"; };
 const num = n => (n || 0).toLocaleString("en-US");
 const when = t => new Date(t * 1000).toLocaleString();
-let selected = location.hash.slice(1), openRun = "", runCache = {};
+const QS = new URLSearchParams(location.search);
+let selected = QS.get("task") || location.hash.slice(1), openRun = "", runCache = {};
 
 async function get(url) { const r = await fetch(url); return r.ok ? r.json() : null; }
 
@@ -450,7 +541,7 @@ function renderDetail(t) {
   const nl = main.querySelector(".live"); if (nl && stick) nl.scrollTop = nl.scrollHeight;
 }
 // ---- the working directory: browse, preview, upload ----
-let dir = "", shown = "", note = "";
+let dir = QS.get("dir") || "", shown = "", note = "", view = QS.get("view") === "gallery" ? "gallery" : "list", gpage = 1, grec = false, gsort = "name", gitems = [], gat = -1;
 const size = n => n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1) + " KB" : n < 1073741824 ? (n/1048576).toFixed(1) + " MB" : (n/1073741824).toFixed(2) + " GB";
 const join = (a, b) => a ? a + "/" + b : b;
 const fq = (path) => `name=${encodeURIComponent(selected)}&path=${encodeURIComponent(path)}`;
@@ -464,15 +555,18 @@ async function refreshFiles(first) {
   if (!l) { if (dir) { dir = ""; return refreshFiles(); }
     out.push($("div", "meta", "The working directory cannot be read.")); box.replaceChildren(...out); return; }
   const bar = $("div", "bar"), crumbs = $("div", "crumbs");
-  const go = (p) => { dir = p; shown = ""; note = ""; refreshFiles(); };
+  const go = (p) => { dir = p; shown = ""; note = ""; gpage = 1; refreshFiles(); };
   const root = $("a", "", "workspace"); root.onclick = () => go(""); crumbs.append(root);
   let acc = ""; for (const part of l.path ? l.path.split("/") : []) { acc = join(acc, part); const p = acc;
     const a = $("a", "", part); a.onclick = () => go(p); crumbs.append(" / ", a); }
   const pick = $("input"); pick.type = "file"; pick.multiple = true; pick.hidden = true;
   pick.onchange = () => upload(pick.files);
   const up = $("button", "", "Upload files here"); up.onclick = () => pick.click();
-  bar.append(crumbs, up, pick); out.push(bar);
+  const vl = $("button", view === "list" ? "on" : "", "List"), vg = $("button", view === "gallery" ? "on" : "", "Gallery");
+  vl.onclick = () => { view = "list"; refreshFiles(); }; vg.onclick = () => { view = "gallery"; shown = ""; refreshFiles(); };
+  bar.append(crumbs, vl, vg, up, pick); out.push(bar);
   if (note) out.push($("div", "meta", note));
+  if (view === "gallery") { box.replaceChildren(...out, await gallery(first && BOOT.media)); return; }
   const wrap = $("div", "tablewrap"), tb = $("table");
   const hr = $("tr"); hr.append($("th", "", "name"), $("th", "num", "size"), $("th", "", "modified")); tb.append(hr);
   for (const e of l.entries) {
@@ -489,12 +583,63 @@ async function refreshFiles(first) {
   out.push($("div", "drop", "Drop files anywhere on this section to upload them into the folder shown. A file of the same name is replaced."));
   box.replaceChildren(...out);
 }
+async function gallery(first) {
+  const wrap = $("div"), task = selected;
+  const g = first || await get(`/api/media?${fq(dir)}&page=${gpage}&per=48&sort=${gsort}&recursive=${grec ? 1 : 0}`);
+  if (!g || task !== selected) { wrap.append($("div", "meta", "This folder cannot be read.")); return wrap; }
+  gpage = g.page; gitems = g.items;
+  const pager = () => { const p = $("div", "pager");
+    const b = (label, to, off) => { const x = $("button", "", label); x.disabled = off; x.onclick = () => { gpage = to; refreshFiles(); }; return x; };
+    p.append(b("« First", 1, g.page <= 1), b("‹ Previous", g.page - 1, g.page <= 1),
+      $("span", "", `Page ${g.page} of ${g.pages}`), b("Next ›", g.page + 1, g.page >= g.pages), b("Last »", g.pages, g.page >= g.pages),
+      $("span", "meta", `${num(g.total)} pictures and videos`));
+    return p; };
+  const opts = $("div", "pager"), sel = $("select"), lab = $("label"), cb = $("input"), rf = $("button", "", "Refresh");
+  for (const [v, t] of [["name", "Sort by name"], ["newest", "Newest first"]]) { const o = $("option", "", t); o.value = v; o.selected = gsort === v; sel.append(o); }
+  sel.onchange = () => { gsort = sel.value; gpage = 1; refreshFiles(); };
+  cb.type = "checkbox"; cb.checked = grec; cb.onchange = () => { grec = cb.checked; gpage = 1; refreshFiles(); };
+  lab.append(cb, " Include subfolders"); rf.onclick = () => refreshFiles();
+  opts.append(sel, lab, rf); wrap.append(opts);
+  if (!g.total) { wrap.append($("div", "meta", grec ? "No pictures or videos here." : "No pictures or videos in this folder. Try “Include subfolders”.")); return wrap; }
+  wrap.append(pager());
+  const grid = $("div", "grid");
+  g.items.forEach((it, i) => {
+    const cell = $("div", "cell"), th = $("div", "thumb"), src = "/raw?" + fq(it.path);
+    if (it.video) { const v = $("video"); v.src = src + "#t=0.1"; v.preload = "metadata"; v.muted = true; th.append(v, $("span", "play", "▶ video")); }
+    else { const im = $("img"); im.src = src; im.loading = "lazy"; im.alt = it.name; th.append(im); }
+    cell.title = it.path; cell.append(th, $("div", "cap", it.name)); cell.onclick = () => openBox(i);
+    grid.append(cell);
+  });
+  wrap.append(grid, pager());
+  if (g.cut) wrap.append($("div", "meta", "This folder tree is very large; only part of it was scanned."));
+  return wrap;
+}
+const lb = document.getElementById("box");
+function openBox(i) {
+  if (i < 0 || i >= gitems.length) return;
+  gat = i; const it = gitems[i], src = "/raw?" + fq(it.path), m = lb.querySelector(".m"), t = lb.querySelector(".t");
+  let el; if (it.video) { el = $("video"); el.controls = true; el.autoplay = true; } else { el = $("img"); el.alt = it.name; }
+  el.src = src; m.replaceChildren(el);
+  const dl = $("a", "", "Download"); dl.href = src; dl.download = "";
+  t.replaceChildren(`${it.path} · ${size(it.size)} · ${(gpage - 1) * 48 + i + 1} of the gallery · `, dl);
+  lb.querySelector(".prev").disabled = i === 0; lb.querySelector(".next").disabled = i === gitems.length - 1;
+  lb.classList.add("open");
+}
+function closeBox() { lb.classList.remove("open"); lb.querySelector(".m").replaceChildren(); gat = -1; }
+lb.querySelector(".close").onclick = closeBox;
+lb.querySelector(".prev").onclick = e => { e.stopPropagation(); openBox(gat - 1); };
+lb.querySelector(".next").onclick = e => { e.stopPropagation(); openBox(gat + 1); };
+lb.onclick = e => { if (e.target === lb) closeBox(); };
+document.addEventListener("keydown", e => { if (gat < 0) return;
+  if (e.key === "Escape") closeBox(); else if (e.key === "ArrowLeft") openBox(gat - 1); else if (e.key === "ArrowRight") openBox(gat + 1); });
+
 async function showFile(path, cell) {
   const raw = "/raw?" + fq(path), p = await get("/api/file?" + fq(path));
   cell.replaceChildren();
   const dl = $("a", "", "Download"); dl.href = raw; dl.download = "";
   if (!p) { cell.append($("span", "meta", "This file is gone.")); return; }
   if (p.image) { const img = $("img"); img.src = raw; img.alt = path; cell.append(img, $("div"), dl); return; }
+  if (p.video) { const v = $("video"); v.src = raw; v.controls = true; v.preload = "metadata"; cell.append(v, $("div"), dl); return; }
   if (p.binary) { cell.append($("span", "meta", `Binary file, ${size(p.size)}. `), dl); return; }
   cell.append($("pre", "", p.text), $("div", "meta", p.cut ? `Only the first part of ${size(p.size)} is shown. ` : ""), dl);
 }
@@ -518,11 +663,11 @@ fb.addEventListener("dragleave", () => fb.classList.remove("drag"));
 fb.addEventListener("drop", e => { e.preventDefault(); fb.classList.remove("drag"); if (e.dataTransfer.files.length) upload(e.dataTransfer.files); });
 
 const BOOT = /*BOOT*/null;
-if (BOOT && BOOT.tasks.length && (!selected || selected === BOOT.tasks[0].name)) {
-  selected = BOOT.tasks[0].name; renderList(BOOT.tasks); renderDetail(BOOT.task);
+if (BOOT && BOOT.name && (!selected || selected === BOOT.name)) {
+  selected = BOOT.name; renderList(BOOT.tasks); renderDetail(BOOT.task);
   refreshFiles(BOOT.files);
 } else { refreshList(); refreshDetail(); refreshFiles(); }
-setInterval(() => { if (!document.hidden && !shown && !note.startsWith("Uploading") && !window.getSelection().toString()) refreshFiles(); }, 6000);
+setInterval(() => { if (!document.hidden && !shown && view === "list" && !note.startsWith("Uploading") && !window.getSelection().toString()) refreshFiles(); }, 6000);
 setInterval(refreshList, 5000);
 setInterval(() => { if (!document.hidden && !window.getSelection().toString()) refreshDetail(); }, 2000);
 </script></body></html>

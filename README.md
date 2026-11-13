@@ -82,6 +82,12 @@ download any file, and upload files into the folder shown (button or drag and dr
 a file of the same name is replaced, up to 2 GB each). The page cannot reach anything
 outside the working directory, and it cannot delete or rename.
 
+**Gallery** switches the folder to a grid of its pictures and videos, 48 to a page, with
+first / previous / next / last. It can sort by name or newest first and can include
+subfolders. Click a tile for the full picture or to play the video; the arrow keys move
+to the neighbours and Esc closes. `/?task=NAME&dir=FOLDER&view=gallery` opens a gallery
+directly.
+
 Task records are kept in `~/.codex-loop/tasks/`, so the list survives a reboot; the
 details of a task (progress, conversations, state) are read from its `/tmp` directory
 and disappear with it. `--web-host 0.0.0.0` makes the page reachable from other
