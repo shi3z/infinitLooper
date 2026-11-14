@@ -91,6 +91,8 @@ with its duration and token counts. Click a conversation to see the commands it 
 and what it said.
 
 Below that is the task's working directory: browse folders, preview text and images,
+read Markdown files such as `report.md` rendered (headings, lists, tables, code,
+links, and pictures taken from the working directory; a Source button shows the text),
 download any file, and upload files into the folder shown (button or drag and drop;
 a file of the same name is replaced, up to 2 GB each; needs the token). The page cannot reach anything
 outside the working directory, and it cannot delete or rename.

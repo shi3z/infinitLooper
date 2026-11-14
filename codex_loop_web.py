@@ -190,7 +190,8 @@ def preview(f: Path) -> dict | None:
         head = h.read(MAX_PREVIEW)
     if b"\0" in head[:8000]:
         return {"size": size, "binary": True}
-    return {"size": size, "text": head.decode("utf-8", errors="replace"), "cut": size > MAX_PREVIEW}
+    return {"size": size, "text": head.decode("utf-8", errors="replace"), "cut": size > MAX_PREVIEW,
+            "markdown": ext in (".md", ".markdown", ".mdown")}
 
 
 def read_token(home: Path) -> str:
@@ -300,17 +301,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data: object = None
         if url.path == "/":
             # The newest task is drawn with the page itself, so there is no empty first paint.
-            # `/?task=NAME&dir=FOLDER&view=gallery` opens that task at that folder, with the gallery showing.
+            # `/?task=NAME&dir=FOLDER&view=gallery` opens that task at that folder, with the gallery showing;
+            # `&file=NAME` opens that file of the folder instead.
             ts = tasks(self.root)
             want = q.get("task", "")
             first = want if any(t["name"] == want for t in ts) else ts[0]["name"] if ts else ""
             boot = {"tasks": ts, "name": first, "open": not self.token, "task": detail(self.root, first) if first else None,
-                    "files": None, "media": None}
+                    "files": None, "media": None, "file": None}
             where = inside(self.root, first, q.get("dir", "")) if first else None
             if where:
                 boot["files"] = listing(*where)
                 if q.get("view") == "gallery":
                     boot["media"] = media(*where, False, False, 1, 48)
+                opened = inside(self.root, first, os.path.join(q.get("dir", ""), q["file"])) if q.get("file") else None
+                if opened:
+                    boot["file"] = preview(opened[1])
             blob = json.dumps(boot, ensure_ascii=False).replace("</", "<\\/")
             return self.send(PAGE.replace("/*BOOT*/null", blob).encode(), "text/html; charset=utf-8")
         if url.path == "/api/tasks":
@@ -528,6 +533,22 @@ td.name { white-space:normal; overflow-wrap:anywhere; }
 .pv img { max-width:100%; border:1px solid var(--line); border-radius:6px; }
 .pv pre { max-height:60vh; overflow:auto; }
 .pv video { max-width:100%; max-height:70vh; }
+.md { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 22px 16px; max-width:900px;
+      overflow-wrap:anywhere; font-size:15px; line-height:1.65; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { text-transform:none; letter-spacing:0; color:var(--text); margin:1.3em 0 .5em; line-height:1.3; }
+.md h1 { font-size:1.7em; border-bottom:1px solid var(--line); padding-bottom:.25em; }
+.md h2 { font-size:1.35em; border-bottom:1px solid var(--line); padding-bottom:.2em; }
+.md h3 { font-size:1.15em; } .md h4, .md h5, .md h6 { font-size:1em; }
+.md p, .md ul, .md ol, .md blockquote, .md pre, .md .tablewrap { margin:.7em 0; }
+.md ul, .md ol { padding-left:1.6em; } .md li { margin:.2em 0; } .md li > ul, .md li > ol { margin:.2em 0; }
+.md li.todo { list-style:none; margin-left:-1.3em; }
+.md code { background:var(--code); border-radius:4px; padding:.1em .35em; font:.88em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.md pre { max-height:none; } .md pre code { background:none; padding:0; font-size:1em; }
+.md blockquote { border-left:3px solid var(--line); margin-left:0; padding:.1em 1em; color:var(--dim); }
+.md a { color:var(--accent); } .md img { max-width:100%; }
+.md hr { border:0; border-top:1px solid var(--line); margin:1.4em 0; }
+.md th, .md td { white-space:normal; padding:5px 12px; border:1px solid var(--line); }
+.md th { color:var(--text); font-weight:600; font-size:inherit; background:var(--code); }
 button.on { border-color:var(--accent); color:var(--accent); }
 button:disabled { opacity:.45; cursor:default; }
 .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:10px; }
@@ -690,7 +711,7 @@ function renderDetail(t) {
   const nl = main.querySelector(".live"); if (nl && stick) nl.scrollTop = nl.scrollHeight;
 }
 // ---- the working directory: browse, preview, upload ----
-let dir = QS.get("dir") || "", shown = "", note = "", view = QS.get("view") === "gallery" ? "gallery" : "list", gpage = 1, grec = false, gsort = "name", gitems = [], gat = -1;
+let dir = QS.get("dir") || "", shown = QS.get("file") || "", note = "", view = QS.get("view") === "gallery" ? "gallery" : "list", gpage = 1, grec = false, gsort = "name", gitems = [], gat = -1;
 const size = n => n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1) + " KB" : n < 1073741824 ? (n/1048576).toFixed(1) + " MB" : (n/1073741824).toFixed(2) + " GB";
 const join = (a, b) => a ? a + "/" + b : b;
 const fq = (path) => `name=${encodeURIComponent(selected)}&path=${encodeURIComponent(path)}`;
@@ -724,7 +745,7 @@ async function refreshFiles(first) {
     td.append(a); tr.append(td, $("td", "num", e.dir ? "" : size(e.size)), $("td", "", e.mtime ? when(e.mtime) : ""));
     tb.append(tr);
     if (!e.dir && shown === e.name) { const x = $("tr"), c = $("td", "pv"); c.colSpan = 3; c.style.whiteSpace = "normal";
-      x.append(c); tb.append(x); showFile(join(l.path, e.name), c); }
+      x.append(c); tb.append(x); showFile(join(l.path, e.name), c, first && BOOT.file); }
   }
   if (!l.entries.length) { const tr = $("tr"), td = $("td", "meta", "This folder is empty."); td.colSpan = 3; tr.append(td); tb.append(tr); }
   wrap.append(tb); out.push(wrap);
@@ -782,15 +803,106 @@ lb.onclick = e => { if (e.target === lb) closeBox(); };
 document.addEventListener("keydown", e => { if (gat < 0) return;
   if (e.key === "Escape") closeBox(); else if (e.key === "ArrowLeft") openBox(gat - 1); else if (e.key === "ArrowRight") openBox(gat + 1); });
 
-async function showFile(path, cell) {
-  const raw = "/raw?" + fq(path), p = await get("/api/file?" + fq(path));
+// ---- Markdown, built as DOM nodes: nothing in a file can become markup or script of this page ----
+function mdUrl(u, base) {
+  if (/^(https?:|mailto:)/i.test(u)) return u;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(u) || u.startsWith("#") || u.startsWith("//")) return null;   // javascript:, data:, anchors
+  let rel; try { rel = decodeURIComponent(u.split("#")[0].split("?")[0]); } catch (e) { return null; }
+  const parts = rel.startsWith("/") ? [] : base.split("/").slice(0, -1);
+  for (const seg of rel.split("/")) { if (seg === "..") parts.pop(); else if (seg && seg !== ".") parts.push(seg); }
+  return "/raw?" + fq(parts.join("/"));       // a file of the working directory
+}
+function mdInline(text, parent, base) {
+  const re = /(`+)(.+?)\1|!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)|\[((?:[^\]\\]|\\.)+)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)|\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|\*([^*\s](?:[^*]*[^*\s])?)\*|(?<![A-Za-z0-9])_([^_\s](?:[^_]*[^_\s])?)_(?![A-Za-z0-9])|<(https?:\/\/[^\s>]+)>|(https?:\/\/[^\s<>]*[^\s<>.,;:!?)\]'"])|\\([\\`*_{}\[\]()#+\-.!|~>])/g;
+  let at = 0, m;
+  const wrap = (tag, inner) => { const e = document.createElement(tag); mdInline(inner, e, base); parent.append(e); };
+  const link = (label, u, plain) => { const h = mdUrl(u, base);
+    if (!h) { parent.append(plain ? label : "[" + label + "](" + u + ")"); return; }
+    const a = document.createElement("a"); a.href = h; if (/^https?:/i.test(h)) { a.target = "_blank"; a.rel = "noopener noreferrer"; }
+    if (plain) a.textContent = label; else mdInline(label, a, base); parent.append(a); };
+  while ((m = re.exec(text))) {
+    if (m.index > at) parent.append(text.slice(at, m.index));
+    at = re.lastIndex;
+    if (m[1]) parent.append($("code", "", m[2].trim() || m[2]));
+    else if (m[4] !== undefined && m[3] !== undefined) { const h = mdUrl(m[4], base);
+      if (h) { const im = document.createElement("img"); im.src = h; im.alt = m[3]; im.loading = "lazy"; parent.append(im); } else parent.append(m[0]); }
+    else if (m[5] !== undefined) link(m[5], m[6]);
+    else if (m[7] !== undefined) wrap("strong", m[7]); else if (m[8] !== undefined) wrap("strong", m[8]);
+    else if (m[9] !== undefined) wrap("del", m[9]);
+    else if (m[10] !== undefined) wrap("em", m[10]); else if (m[11] !== undefined) wrap("em", m[11]);
+    else if (m[12] !== undefined) link(m[12], m[12], true); else if (m[13] !== undefined) link(m[13], m[13], true);
+    else if (m[14] !== undefined) parent.append(m[14]);
+  }
+  if (at < text.length) parent.append(text.slice(at));
+}
+function markdown(src, base) {
+  const root = $("div", "md"), lines = src.replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n");
+  const isItem = l => /^\s*(?:[-*+]|\d{1,9}[.)])\s+\S/.test(l), isRule = l => /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(l);
+  const isSep = l => /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/.test(l) && l.includes("-") && l.includes("|");
+  const cells = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
+  const starts = (l, next) => /^ {0,3}(?:#{1,6}\s|>|```|~~~)/.test(l) || isRule(l) || isItem(l) || (l.includes("|") && next !== undefined && isSep(next));
+  let i = 0;
+  if (lines[0] === "---") { const end = lines.indexOf("---", 1);            // front matter: show it as it is
+    if (end > 0) { root.append($("pre", "", lines.slice(1, end).join("\n"))); i = end + 1; } }
+  while (i < lines.length) {
+    const l = lines[i]; let m;
+    if (!l.trim()) { i++; continue; }
+    if ((m = /^ {0,3}(```+|~~~+)\s*(\S*)/.exec(l))) { const body = []; i++;
+      while (i < lines.length && !lines[i].trim().startsWith(m[1])) body.push(lines[i++]);
+      i++; const pre = $("pre"); pre.append($("code", "", body.join("\n"))); root.append(pre); continue; }
+    if ((m = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(l))) { const h = document.createElement("h" + m[1].length); mdInline(m[2], h, base); root.append(h); i++; continue; }
+    if (isRule(l)) { root.append(document.createElement("hr")); i++; continue; }
+    if (/^ {0,3}>/.test(l)) { const body = [];
+      while (i < lines.length && lines[i].trim() && (/^ {0,3}>/.test(lines[i]) || !starts(lines[i], lines[i + 1]))) body.push(lines[i++].replace(/^ {0,3}>\s?/, ""));
+      const q = document.createElement("blockquote"); q.append(...markdown(body.join("\n"), base).childNodes); root.append(q); continue; }
+    if (l.includes("|") && i + 1 < lines.length && isSep(lines[i + 1])) {
+      const wrap = $("div", "tablewrap"), tb = document.createElement("table"), al = cells(lines[i + 1]).map(c => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "");
+      const row = (line, tag) => { const tr = document.createElement("tr"); cells(line).forEach((c, k) => { const td = document.createElement(tag); if (al[k]) td.style.textAlign = al[k]; mdInline(c, td, base); tr.append(td); }); tb.append(tr); };
+      row(l, "th"); i += 2; while (i < lines.length && lines[i].trim() && lines[i].includes("|")) row(lines[i++], "td");
+      wrap.append(tb); root.append(wrap); continue; }
+    if (isItem(l)) { const stack = [];
+      while (i < lines.length) { const x = lines[i], it = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/.exec(x);
+        if (!x.trim()) { const n = lines[i + 1]; if (n !== undefined && (isItem(n) || /^\s{2,}\S/.test(n))) { i++; continue; } break; }
+        if (!it || isRule(x)) { if (/^\s+\S/.test(x) || !starts(x, lines[i + 1])) { const li = stack[stack.length - 1].last; li.append(" "); mdInline(x.trim(), li, base); i++; continue; } break; }
+        const ind = it[1].length;
+        while (stack.length > 1 && ind < stack[stack.length - 1].ind) stack.pop();
+        const tag = /\d/.test(it[2]) ? "OL" : "UL";
+        if (stack.length && ind <= stack[stack.length - 1].ind + 1 && stack[stack.length - 1].el.tagName !== tag) stack.pop();   // bullets, then numbers: a new list
+        if (!stack.length || ind > stack[stack.length - 1].ind + 1) { const list = document.createElement(tag.toLowerCase());
+          if (list.tagName === "OL" && parseInt(it[2]) !== 1) list.start = parseInt(it[2]);
+          (stack.length ? stack[stack.length - 1].last : root).append(list); stack.push({ ind, el: list, last: null }); }
+        const top = stack[stack.length - 1], li = document.createElement("li"), todo = /^\[([ xX])\]\s+(.*)$/.exec(it[3]);
+        if (todo) { const cb = document.createElement("input"); cb.type = "checkbox"; cb.disabled = true; cb.checked = todo[1] !== " "; li.className = "todo"; li.append(cb, " "); mdInline(todo[2], li, base); }
+        else mdInline(it[3], li, base);
+        top.el.append(li); top.last = li; i++; }
+      continue; }
+    const body = [l]; i++;
+    while (i < lines.length && lines[i].trim() && (/^ {0,3}(=+|-+)\s*$/.test(lines[i]) || !starts(lines[i], lines[i + 1]))) {
+      if (/^ {0,3}(=+|-+)\s*$/.test(lines[i]) && body.length) { const h = document.createElement(lines[i].trim()[0] === "=" ? "h1" : "h2"); mdInline(body.join(" "), h, base); root.append(h); body.length = 0; i++; break; }
+      body.push(lines[i++]); }
+    if (body.length) { const p = document.createElement("p");
+      body.forEach((b, k) => { mdInline(b.replace(/\s+$/, "").replace(/\\$/, ""), p, base); if (k < body.length - 1) p.append(/( {2,}|\\)$/.test(b) ? document.createElement("br") : "\n"); });
+      root.append(p); }
+  }
+  return root;
+}
+
+async function showFile(path, cell, first) {
+  const raw = "/raw?" + fq(path), p = first || await get("/api/file?" + fq(path));
   cell.replaceChildren();
   const dl = $("a", "", "Download"); dl.href = raw; dl.download = "";
   if (!p) { cell.append($("span", "meta", "This file is gone.")); return; }
   if (p.image) { const img = $("img"); img.src = raw; img.alt = path; cell.append(img, $("div"), dl); return; }
   if (p.video) { const v = $("video"); v.src = raw; v.controls = true; v.preload = "metadata"; cell.append(v, $("div"), dl); return; }
   if (p.binary) { cell.append($("span", "meta", `Binary file, ${size(p.size)}. `), dl); return; }
-  cell.append($("pre", "", p.text), $("div", "meta", p.cut ? `Only the first part of ${size(p.size)} is shown. ` : ""), dl);
+  const tail = [$("div", "meta", p.cut ? `Only the first part of ${size(p.size)} is shown. ` : ""), dl];
+  if (!p.markdown) { cell.append($("pre", "", p.text), ...tail); return; }
+  const bar = $("div", "bar"), r = $("button", "on", "Rendered"), sc = $("button", "", "Source"), body = $("div");
+  const show = raw => { r.className = raw ? "" : "on"; sc.className = raw ? "on" : "";
+    let node; try { node = raw ? $("pre", "", p.text) : markdown(p.text, path); } catch (e) { node = $("pre", "", p.text); }
+    body.replaceChildren(node); };
+  r.onclick = () => show(false); sc.onclick = () => show(true);
+  bar.append(r, sc); cell.append(bar, body, ...tail); show(false);
 }
 async function upload(files) {
   const target = dir, task = selected; let done = 0, failed = [];
