@@ -25,6 +25,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -88,6 +89,14 @@ Write `{sd}/CRITERIA.md`: the completion criteria for the goal. Requirements:
 - together they cover the whole goal and nothing beyond it (no extra scope)
 - a criterion must fail today if the work is not done yet
 
+Also write `{sd}/CHECKS.json`: the criteria that one shell command can decide. The
+harness runs these itself after every iteration, before any model judges anything:
+[{{"id": "C1", "cmd": "python3 -m unittest -q", "timeout": 300}}, ...]
+- `cmd` runs with bash in the working directory; exit code 0 means the criterion holds
+- it must be non-interactive, change nothing in the project, and finish within
+  `timeout` seconds (at most 900); it must fail today if the work is not done
+- leave out a criterion that needs judgment or inspection; an empty list `[]` is fine
+
 Do not start the work itself. Do not create any other file.
 
 {rules}"""
@@ -98,7 +107,9 @@ earlier iterations; everything known is in these files:
 - `{sd}/GOAL.md`      the goal, verbatim (read it first; never edit)
 - `{sd}/CRITERIA.md`  the completion criteria (never edit)
 - `{sd}/STATE.md`     the handoff written by the previous iteration
-- `{sd}/EVAL.md`      the independent evaluator's latest verdict and what is missing
+- `{sd}/EVAL.md`      the latest verdict: which criteria pass, fail or are unknown, and
+                      what is missing. It names evidence files (full check output); read
+                      only the part of one that you need
 {stuck}
 Do the next chunk of real work toward the unmet criteria: the first item of the
 remaining plan, or what the evaluator says is missing. Verify what you did by
@@ -117,18 +128,24 @@ You are the independent evaluator of an autonomous loop. You did not do the work
 and must not trust the worker's claims. Read `{sd}/GOAL.md` and `{sd}/CRITERIA.md`.
 `{sd}/STATE.md` is the worker's own account: use it only to find things to check.
 
+{checks}
 For every criterion, run its check yourself (and anything else needed to be sure)
-and judge from what you observe now. A criterion passes only on direct evidence
-from this conversation. If a check cannot be run, it fails. Also fail a criterion
-that is met only by weakening it (deleted tests, hard-coded outputs, stubs).
+and judge from what you observe now. Give each criterion one of three statuses:
+- "pass": you have direct evidence from this conversation that it holds
+- "fail": you have direct evidence that it does not hold, or it is met only by
+  weakening it (deleted tests, hard-coded outputs, stubs)
+- "unknown": you could not establish either (the check could not be run, the
+  evidence is partial, you ran out of room). Never turn missing evidence into "pass".
+In `evidence` say what you examined and what it showed; for "unknown" say what you
+did not manage to examine.
 
 Do not modify, create or delete any project file. Do not fix anything.
 
 Your final message must be only a JSON object of this shape:
-{{"criteria": [{{"id": "C1", "pass": true, "evidence": "command and what it showed"}}],
+{{"criteria": [{{"id": "C1", "status": "pass", "evidence": "command and what it showed"}}],
   "done": false,
   "feedback": "for the worker: what is missing or wrong, most important first"}}
-`done` is true only if every criterion passes and the goal in GOAL.md is fully met.
+`done` is true only if every criterion is "pass" and the goal in GOAL.md is fully met.
 
 {rules}"""
 
@@ -142,10 +159,10 @@ VERDICT_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["id", "pass", "evidence"],
+                "required": ["id", "status", "evidence"],
                 "properties": {
                     "id": {"type": "string"},
-                    "pass": {"type": "boolean"},
+                    "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
                     "evidence": {"type": "string"},
                 },
             },
@@ -524,7 +541,7 @@ class Loop:
     # ---- protected files ----------------------------------------------------
     def protect(self) -> None:
         """GOAL.md and CRITERIA.md are fixed; undo any edit so the bar cannot be lowered."""
-        for name in ("GOAL.md", "CRITERIA.md"):
+        for name in ("GOAL.md", "CRITERIA.md", "CHECKS.json"):
             keep = self.sd / "frozen" / name
             cur = self.sd / name
             if keep.exists() and sha(keep) != sha(cur):
@@ -614,15 +631,94 @@ class Loop:
             if crit.exists() and "C1" in crit.read_text(errors="replace"):
                 shutil.copyfile(crit, frozen)
                 log("criteria:\n" + crit.read_text(errors="replace").rstrip())
+                checks = self.load_checks(self.sd / "CHECKS.json")
+                (self.sd / "frozen" / "CHECKS.json").write_text(json.dumps(checks, ensure_ascii=False, indent=1))
+                log(f"{len(checks)} criteria have a check the harness runs itself")
                 return
         # The loop must still be able to run: fall back to the goal itself as the only criterion.
         crit.write_text("C1: the goal in GOAL.md is fully achieved\n    check: inspect and run whatever proves it\n")
         shutil.copyfile(crit, frozen)
         log("planner produced no criteria; using the goal itself as the single criterion")
 
-    def evaluate(self, n: int) -> dict:
+    @staticmethod
+    def load_checks(path: Path) -> list[dict]:
+        """The planner's machine checks, kept only where they are well formed."""
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return []
+        out = []
+        for c in raw if isinstance(raw, list) else []:
+            if isinstance(c, dict) and isinstance(c.get("id"), str) and isinstance(c.get("cmd"), str) and c["cmd"].strip():
+                t = c.get("timeout")
+                out.append({"id": c["id"], "cmd": c["cmd"], "timeout": min(900, t) if isinstance(t, int) and t > 0 else 300})
+        return out[:20]
+
+    def run_checks(self, n: int) -> list[dict]:
+        """Run the planner's checks directly: no model is needed to learn that the tests still fail.
+
+        Each command's full output is kept as an evidence file; verdicts refer to it instead of quoting it.
+        Skipped under a sandbox, because the harness itself would be running the commands outside it.
+        """
+        checks = self.load_checks(self.sd / "frozen" / "CHECKS.json")
+        if not checks or self.a.sandbox != "danger-full-access" or self.a.no_checks:
+            return []
+        folder = self.sd / "evidence"
+        folder.mkdir(exist_ok=True)
+        results = []
+        t_all = time.time()
+        for c in checks:
+            t0 = time.time()
+            self.live.begin(f"check {c['id']} #{n}")
+            self.live.feed("cmd", " ".join(c["cmd"].split()))
+            self.live.dump(active=True)
+            try:
+                p = subprocess.run(["bash", "-c", c["cmd"]], cwd=self.ws, stdin=subprocess.DEVNULL, timeout=c["timeout"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                rc, out = p.returncode, p.stdout.decode("utf-8", errors="replace")
+            except subprocess.TimeoutExpired as e:
+                rc, out = "timeout", (e.stdout or b"").decode("utf-8", errors="replace") + f"\n[timed out after {c['timeout']}s]"
+            except OSError as e:
+                rc, out = "error", str(e)
+            ev = folder / f"{n:04d}-{c['id']}.txt"
+            ev.write_text(f"$ {c['cmd']}\n[exit {rc}, {time.time() - t0:.1f}s]\n{out[-200_000:]}")
+            tail = [x for x in out.splitlines() if x.strip()][-6:]
+            results.append({"id": c["id"], "cmd": c["cmd"], "exit": rc, "status": "pass" if rc == 0 else "fail",
+                            "seconds": round(time.time() - t0, 1), "evidence": str(ev), "tail": "\n".join(tail)[-1200:]})
+            self.live.feed("out", f"exit {rc}" + (f": {tail[-1].strip()}" if tail else ""))
+        self.live.end()
+        (self.runs / f"{n:04d}-checks.json").write_text(json.dumps(results, ensure_ascii=False))
+        ok = sum(1 for r in results if r["status"] == "pass")
+        log(f"checks: {ok}/{len(results)} pass ({time.time() - t_all:.0f}s)")
+        self.record({"iteration": n, "role": "checks", "rc": 0, "seconds": round(time.time() - t_all, 1),
+                     "passed": ok, "total": len(results), "usage": {}})
+        return results
+
+    def verdict_from_checks(self, n: int, results: list[dict]) -> dict:
+        """A failing check settles the iteration without an evaluator conversation."""
+        known = {r["id"]: r for r in results}
+        ids = sorted(set(re.findall(r"^(C\d+):", (self.sd / "CRITERIA.md").read_text(errors="replace"), re.M)) | set(known),
+                     key=lambda x: (len(x), x))
+        crits = []
+        for i in ids:
+            r = known.get(i)
+            crits.append({"id": i, "status": r["status"], "evidence": f"`{r['cmd']}` exited {r['exit']}; full output: {r['evidence']}"}
+                         if r else {"id": i, "status": "unknown", "evidence": "not examined: a machine check failed first, "
+                                    "so no evaluator ran this iteration"})
+        failing = [r for r in results if r["status"] != "pass"]
+        feedback = "These checks, run by the harness itself, fail. Make them pass; read the evidence file for the full output.\n" + \
+            "\n".join(f"\n{r['id']}: `{r['cmd']}` exited {r['exit']}\n{r['tail']}" for r in failing)
+        return self.finish_verdict(n, {"criteria": crits, "done": False, "feedback": feedback, "source": "checks"})
+
+    def evaluate(self, n: int, results: list[dict] | None = None) -> dict:
         before = self.workspace_fingerprint()
-        prompt = EVALUATOR_PROMPT.format(sd=self.sd, rules=self.rules())
+        checks = ""
+        if results:
+            checks = ("The harness already ran these machine checks after the last work; their full output is in the "
+                      "named files. They are evidence, not verdicts: a check can be wrong or can be gamed, so confirm "
+                      "what matters yourself, and judge the criteria no check covers.\n" +
+                      "".join(f"- {r['id']}: {r['status']} (exit {r['exit']}) {r['evidence']}\n" for r in results))
+        prompt = EVALUATOR_PROMPT.format(sd=self.sd, rules=self.rules(), checks=checks)
         text = self.codex("evaluator", n, prompt, self.a.sandbox, self.sd / "verdict.schema.json")
         verdict = extract_json(text)
         if verdict is None:
@@ -635,18 +731,31 @@ class Loop:
             verdict = {"criteria": [], "done": False,
                        "feedback": "The evaluator gave no usable verdict. Re-run every check in CRITERIA.md "
                                    "yourself and record the exact results in STATE.md."}
-        crits = verdict.get("criteria") or []
-        # The harness, not the model, decides: done needs every criterion passing.
-        all_pass = bool(crits) and all(c.get("pass") is True for c in crits)
+        verdict["source"] = "evaluator"
+        return self.finish_verdict(n, verdict)
+
+    def finish_verdict(self, n: int, verdict: dict) -> dict:
+        crits = [c for c in verdict.get("criteria") or [] if isinstance(c, dict)]
+        for c in crits:  # three states; anything that is not a clear pass or fail is unknown
+            st = c.get("status")
+            if st not in ("pass", "fail", "unknown"):
+                st = "pass" if c.get("pass") is True else "fail" if c.get("pass") is False else "unknown"
+            c["status"], c["pass"] = st, st == "pass"
+        verdict["criteria"] = crits
+        # The harness, not the model, decides: done needs every criterion passing. Unknown is not a pass.
+        all_pass = bool(crits) and all(c["status"] == "pass" for c in crits)
         verdict["done"] = bool(verdict.get("done")) and all_pass
-        lines = [f"# Evaluation after iteration {n}", "",
+        by = "the harness's machine checks" if verdict.get("source") == "checks" else "the independent evaluator"
+        lines = [f"# Evaluation after iteration {n} (by {by})", "",
                  f"done: {str(verdict['done']).lower()}", ""]
         for c in crits:
-            lines.append(f"- {c.get('id')}: {'PASS' if c.get('pass') else 'FAIL'} - {c.get('evidence', '')}")
+            lines.append(f"- {c.get('id')}: {c['status'].upper()} - {c.get('evidence', '')}")
         lines += ["", "## Feedback", str(verdict.get("feedback", "")).strip(), ""]
         (self.sd / "EVAL.md").write_text("\n".join(lines))
-        passed = sum(1 for c in crits if c.get("pass"))
-        log(f"evaluation: {passed}/{len(crits)} criteria pass, done={verdict['done']}")
+        passed = sum(1 for c in crits if c["status"] == "pass")
+        unknown = sum(1 for c in crits if c["status"] == "unknown")
+        log(f"evaluation ({verdict.get('source')}): {passed}/{len(crits)} criteria pass, {unknown} unknown, "
+            f"done={verdict['done']}")
         self.record({"iteration": n, "role": "verdict", "verdict": verdict})
         self.task(passed=passed, criteria=len(crits), done=verdict["done"])
         return verdict
@@ -659,6 +768,7 @@ class Loop:
         started = time.time()
         stale = 0
         failures = 0
+        prefiltered = 0
         while True:
             n += 1
             if self.a.max_iters and n - done_iters > self.a.max_iters:
@@ -694,7 +804,16 @@ class Loop:
                 time.sleep(wait)
                 continue
             failures = 0
-            verdict = self.evaluate(n)
+            results = self.run_checks(n)
+            if any(r["status"] != "pass" for r in results) and prefiltered < 2:
+                # Cheap and certain: the worker hears about the failing commands at once. After two such
+                # rounds in a row the evaluator looks anyway, in case a check itself is wrong.
+                prefiltered += 1
+                self.verdict_from_checks(n, results)
+                self.protect()
+                continue
+            prefiltered = 0
+            verdict = self.evaluate(n, results)
             self.protect()
             if verdict["done"]:
                 t = self.totals
@@ -752,6 +871,8 @@ def main() -> int:
                    help="web UI: no access token for starting and stopping tasks and uploading. Anyone who can "
                         "reach the page can then run commands as you")
     p.add_argument("--web-port", type=int, default=8790, help="port of the web UI (default: %(default)s)")
+    p.add_argument("--no-checks", action="store_true",
+                   help="do not run the planner's machine checks directly; leave all judging to the evaluator")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
     a = p.parse_args()

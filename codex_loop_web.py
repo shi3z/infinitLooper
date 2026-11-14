@@ -98,6 +98,14 @@ def run(root: Path, name: str, tag: str) -> dict | None:
     if t is None or not NAME.match(tag):
         return None
     runs = Path(str(t.get("state", ""))) / "runs"
+    if tag.endswith("-checks"):  # the commands the harness ran itself
+        try:
+            results = json.loads((runs / f"{tag}.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return {"tag": tag, "last": "checks", "steps": [
+            {"kind": "cmd", "text": f"[{r.get('id')}] {r.get('cmd', '')}"[:2000], "exit": r.get("exit"),
+             "output": str(r.get("tail", ""))} for r in results if isinstance(r, dict)]}
     steps = []
     for line in read(runs / f"{tag}.jsonl", 4_000_000).splitlines():
         try:
@@ -501,7 +509,7 @@ button.danger { color:var(--bad); }
 main { overflow:auto; padding:20px 24px 60px; }
 .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:600;
          border:1px solid currentColor; margin-right:6px; }
-.running { color:var(--run); } .done { color:var(--ok); } .stopped { color:var(--dim); } .fail { color:var(--bad); }
+.running { color:var(--run); } .done { color:var(--ok); } .stopped, .unknown { color:var(--dim); } .fail { color:var(--bad); }
 h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:26px 0 8px; }
 .goal { font-size:16px; white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0 6px; }
 .facts { display:flex; flex-wrap:wrap; gap:6px 22px; color:var(--dim); font-size:13px; }
@@ -673,10 +681,10 @@ function renderDetail(t) {
   const verdicts = t.log.filter(r => r.role === "verdict");
   if (verdicts.length) {
     const v = verdicts[verdicts.length - 1];
-    out.push(section(`Latest evaluation (iteration ${v.iteration})`));
+    out.push(section(`Latest evaluation (iteration ${v.iteration}, by ${v.verdict.source === "checks" ? "machine checks" : "the evaluator"})`));
     const c = $("div", "crit");
-    for (const x of v.verdict.criteria || [])
-      c.append($("span", "badge " + (x.pass ? "done" : "fail"), x.id + (x.pass ? " pass" : " fail")), $("span", "ev", x.evidence || ""));
+    for (const x of v.verdict.criteria || []) { const st = x.status || (x.pass ? "pass" : "fail");
+      c.append($("span", "badge " + (st === "pass" ? "done" : st), x.id + " " + st), $("span", "ev", x.evidence || "")); }
     out.push(c);
     if (v.verdict.feedback) { const d = $("details"); d.append($("summary", "", "Feedback to the worker"), $("pre", "", v.verdict.feedback)); out.push(d); }
   }
@@ -690,8 +698,8 @@ function renderDetail(t) {
     for (const r of runs.slice().reverse()) {
       const tag = String(r.iteration).padStart(4, "0") + "-" + r.role;
       const tr = $("tr", "row");
-      const v = verdicts.find(x => x.iteration === r.iteration && r.role.startsWith("evaluator"));
-      const res = r.rc !== 0 ? "rc " + r.rc : v ? `${(v.verdict.criteria||[]).filter(c => c.pass).length}/${(v.verdict.criteria||[]).length} pass` : "ok";
+      const v = verdicts.find(x => x.iteration === r.iteration && r.role.startsWith("evaluator") && x.verdict.source !== "checks");
+      const res = r.rc !== 0 ? "rc " + r.rc : r.role === "checks" ? `${r.passed}/${r.total} pass` : v ? `${(v.verdict.criteria||[]).filter(c => c.pass).length}/${(v.verdict.criteria||[]).length} pass` : "ok";
       tr.append($("td", "", (r.time || "").replace("T", " ")), $("td", "num", String(r.iteration)), $("td", "", r.role), $("td", r.rc !== 0 ? "fail" : "", res),
         $("td", "num", String(Math.round(r.seconds))), $("td", "num", num((r.usage||{}).input_tokens)), $("td", "num", num((r.usage||{}).output_tokens)));
       tr.onclick = () => { openRun = openRun === tag ? "" : tag; refreshDetail(); };
