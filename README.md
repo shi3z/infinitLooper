@@ -147,6 +147,24 @@ own Codex configuration to `~/.codex-loop/homes/<context name>` and leaves
 | `LOOP_URL` | the server address (default: `http://127.0.0.1:8080/v1`) |
 | `LOOP_SERVER` | optional command that starts the server; run when nothing answers on `LOOP_URL` |
 
+### A server without the Responses API (YASAKANI)
+
+Codex speaks the Responses API. For a server that offers only `/v1/chat/completions`, such as
+[YASAKANI](https://github.com/shi3z/yasakani-not5090) (`yasakani serve`), run `responses_adapter.py`
+in front of it. It listens where `codex-loop` expects the model server and translates both ways,
+streaming: thinking, answers and tool calls. Only the Python standard library is needed.
+
+```sh
+yasakani serve --port 8766 --model-dir ./model-speed --dll build/libyskn.so
+python3 responses_adapter.py --upstream http://127.0.0.1:8766/v1 --port 8080
+codex-loop "goal"            # LOOP_URL defaults to http://127.0.0.1:8080/v1
+```
+
+`--effort off|low|medium|high|xhigh` fixes the thinking setting for every request, and
+`--thinking-budget N` closes the thinking after N tokens. Tested with codex-cli 0.168.0 and the
+YASAKANI speed model on an RTX 5060 Ti 16 GB (context 65,536): a small coding goal was planned,
+done and evaluated in 92 s.
+
 To use OpenAI's hosted models instead, run the script directly with Codex's built-in
 provider: `python3 codex_loop.py --base-url '' --model <model> "goal"`.
 
