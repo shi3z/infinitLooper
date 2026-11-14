@@ -4,7 +4,8 @@
 It serves what the loop already writes: the task records in ~/.codex-loop/tasks/ and,
 while it still exists, each task's state directory under /tmp. It also browses the task's
 working directory, takes uploads into it, and can start and stop tasks. Everything that
-changes something (start, stop, upload) needs the access token in ~/.codex-loop/web-token.
+changes something (start, stop, upload) needs the access token in ~/.codex-loop/web-token,
+unless the UI was started with --web-open.
 Standard library only. Start it with `codex_loop.py --web`.
 """
 from __future__ import annotations
@@ -271,8 +272,15 @@ def stop_task(root: Path, name: str) -> tuple[int, dict]:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     root: Path
-    token: str = ""
+    token: str = ""  # empty: started with --web-open, no token asked
     launch: list[str] = []
+
+    def own_host(self) -> bool:
+        """True when the browser addressed this machine by an IP address or by its own name. A page on
+        another site can point its own domain at this machine; that name is not ours and is refused."""
+        host = self.headers.get("Host", "").rsplit(":", 1)[0].strip("[]").lower()
+        me = socket.gethostname().lower()
+        return bool(re.fullmatch(r"[0-9.]+|[0-9a-f:]+", host)) or host in ("localhost", me) or host.startswith(me + ".")
 
     def log_message(self, *_: object) -> None:
         pass
@@ -296,7 +304,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ts = tasks(self.root)
             want = q.get("task", "")
             first = want if any(t["name"] == want for t in ts) else ts[0]["name"] if ts else ""
-            boot = {"tasks": ts, "name": first, "task": detail(self.root, first) if first else None,
+            boot = {"tasks": ts, "name": first, "open": not self.token, "task": detail(self.root, first) if first else None,
                     "files": None, "media": None}
             where = inside(self.root, first, q.get("dir", "")) if first else None
             if where:
@@ -372,9 +380,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fail = lambda code, msg: self.send(json.dumps({"error": msg}).encode(), "application/json", code)  # noqa: E731
         # A page on another site cannot set this header, so it cannot act through someone's browser.
         if url.path not in ("/api/upload", "/api/start", "/api/stop", "/api/token") \
-                or self.headers.get("X-Codex-Loop") != "1":
+                or self.headers.get("X-Codex-Loop") != "1" or not self.own_host():
             return fail(404, "not found")
-        if not hmac.compare_digest(self.headers.get("X-Token", "").encode(), self.token.encode()):
+        if self.token and not hmac.compare_digest(self.headers.get("X-Token", "").encode(), self.token.encode()):
             return fail(403, "The access token is missing or wrong.")
         if url.path == "/api/token":
             return self.send(b'{"ok": true}', "application/json")
@@ -425,9 +433,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send(json.dumps({"ok": True, "name": fname, "size": size, "replaced": replaced}).encode(), "application/json")
 
 
-def serve(root: Path, host: str, port: int, launch: list[str]) -> int:
+def serve(root: Path, host: str, port: int, launch: list[str], open_access: bool = False) -> int:
     """`launch` is the command that starts a loop; `-C DIR`, options and the goal are appended to it."""
-    Handler.root, Handler.launch, Handler.token = root, launch, read_token(root.parent)
+    Handler.root, Handler.launch = root, launch
+    Handler.token = "" if open_access else read_token(root.parent)
     try:
         srv = http.server.ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
@@ -436,10 +445,16 @@ def serve(root: Path, host: str, port: int, launch: list[str]) -> int:
     srv.daemon_threads = True
     shown = socket.gethostname() if host in ("0.0.0.0", "::") else host
     print(f"codex-loop web UI: http://{shown}:{port}/   (Ctrl+C to stop)", flush=True)
-    print(f"To start or stop tasks and to upload, open it once with the access token:\n"
-          f"  http://{shown}:{port}/?token={Handler.token}\n"
-          f"The token is kept in {root.parent / 'web-token'}. Whoever has it can run commands as you.", flush=True)
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    local = host in ("127.0.0.1", "localhost", "::1")
+    if open_access:
+        print("No access token (--web-open): " + ("any program on this machine" if local else
+              "anyone who can reach this address") + " can start tasks, which means running commands as you.",
+              flush=True)
+    else:
+        print(f"To start or stop tasks and to upload, open it once with the access token:\n"
+              f"  http://{shown}:{port}/?token={Handler.token}\n"
+              f"The token is kept in {root.parent / 'web-token'}. Whoever has it can run commands as you.", flush=True)
+    if not local:
         print("Reading needs no token: anyone who can reach this address can read the goals, logs, command output "
               "and the working directories' files.", flush=True)
     try:
@@ -814,7 +829,7 @@ function newTask() {
     field("Working directory", "On the machine that runs the loop. It is created if it does not exist; a path without a leading / is taken from the home folder.", ws), dl,
     chk,
     field("Stop after this many iterations", "Leave empty to run until the goal is met.", it),
-    field("Access token", "Needed once per browser. It is printed by `codex-loop --web` and kept in ~/.codex-loop/web-token.", tk),
+    ...(BOOT && BOOT.open ? [] : [field("Access token", "Needed once per browser. It is printed by `codex-loop --web` and kept in ~/.codex-loop/web-token.", tk)]),
     $("div", "warn", "The agent runs without approvals and, by default, without a sandbox: its commands have the full rights of the user who started this web UI."),
     msg, row);
   cancel.onclick = () => { mode = "task"; renderList(known); refreshDetail(); refreshFiles(); };

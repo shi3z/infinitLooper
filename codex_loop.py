@@ -748,6 +748,9 @@ def main() -> int:
     p.add_argument("--live-rows", type=int, default=10, help="lines of the live view (default: %(default)s)")
     p.add_argument("--web", action="store_true", help="serve the web UI (task records and live progress) and do nothing else")
     p.add_argument("--web-host", default="127.0.0.1", help="address the web UI listens on (default: %(default)s)")
+    p.add_argument("--web-open", action="store_true",
+                   help="web UI: no access token for starting and stopping tasks and uploading. Anyone who can "
+                        "reach the page can then run commands as you")
     p.add_argument("--web-port", type=int, default=8790, help="port of the web UI (default: %(default)s)")
     p.add_argument("--stuck-after", type=int, default=3,
                    help="iterations without any file change before the worker is told to change approach")
@@ -762,7 +765,7 @@ def main() -> int:
             "--base-url", a.base_url, "--wire-api", a.wire_api, "--api-key-env", a.api_key_env,
             "--context-window", str(a.context_window), "--tool-output-tokens", str(a.tool_output_tokens),
             "--sandbox", a.sandbox, "--iter-timeout", str(a.iter_timeout), "--stuck-after", str(a.stuck_after)]
-        return codex_loop_web.serve(REGISTRY.parent / "tasks", a.web_host, a.web_port, launch)
+        return codex_loop_web.serve(REGISTRY.parent / "tasks", a.web_host, a.web_port, launch, a.web_open)
     if a.goal_file:
         a.goal = Path(a.goal_file).read_text()
     if not a.compact_at:

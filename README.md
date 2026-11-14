@@ -81,6 +81,8 @@ Starting, stopping and uploading need an access token, because whoever can start
 task can run commands as you. `codex-loop --web` prints a link that carries the token;
 open it once and the browser remembers it. The token is kept in
 `~/.codex-loop/web-token`; delete that file to get a new one. Reading needs no token.
+`--web-open` drops the token: then anyone who can reach the page can start tasks. Use
+it only on a network where you trust every machine.
 
 A page with every task on the left and, for the selected one: the goal and status,
 the latest progress (the same stream as the terminal view, refreshed every two
@@ -167,6 +169,7 @@ codex-loop -C path/to/project --max-hours 8 --goal-file goal.md
 | `--live-rows` | 10 | lines of the live view |
 | `--no-live` | | no live view |
 | `--web`, `--web-host`, `--web-port` | off, `127.0.0.1`, 8790 | serve the web UI instead of running a loop |
+| `--web-open` | off | web UI without the access token |
 | `--state`, `--tmp-dir` | remembered, `/tmp` | the context directory, and where a new one is created |
 
 ## Status
